@@ -452,13 +452,112 @@ render_git_view() {
 
 render_footer() {
     local row=$1
-    
+
     tui_goto $row 0
     _bottom_border
     echo ""
-    
+
     tui_goto $((row + 1)) 0
-    echo -e "  ${C_DIM}q${C_NC}: quit  ${C_DIM}r${C_NC}: refresh  ${C_DIM}1${C_NC}: overview  ${C_DIM}2${C_NC}: files  ${C_DIM}3${C_NC}: timeline  ${C_DIM}4${C_NC}: tasks  ${C_DIM}5${C_NC}: cost  ${C_DIM}6${C_NC}: git"
+    echo -e "  ${C_DIM}q${C_NC}: quit  ${C_DIM}r${C_NC}: refresh  ${C_DIM}1${C_NC}: overview  ${C_DIM}2${C_NC}: files  ${C_DIM}3${C_NC}: timeline  ${C_DIM}4${C_NC}: tasks  ${C_DIM}5${C_NC}: cost  ${C_DIM}6${C_NC}: git  ${C_DIM}7${C_NC}: worktrees"
+}
+
+render_worktrees_view() {
+    tui_clear
+    render_header
+
+    local row=5
+    local run_id=$(get_current_run_id)
+    local worktree_dir="$HIVE_DIR/worktrees/$run_id"
+
+    tui_goto $row 0
+    _hr_title "Parallel Worktrees"
+    echo ""
+    row=$((row + 1))
+
+    tui_goto $row 0
+    _empty_row
+    echo ""
+    row=$((row + 1))
+
+    if [ ! -d "$worktree_dir" ]; then
+        tui_goto $row 0
+        _row "  ${C_DIM}No parallel worktrees active${C_NC}"
+        echo ""
+        row=$((row + 1))
+    else
+        local worktree_count=0
+        for wt in "$worktree_dir"/*/; do
+            [ -d "$wt" ] || continue
+            worktree_count=$((worktree_count + 1))
+
+            local task_id=$(basename "$wt")
+            local status_file="$HIVE_DIR/runs/$run_id/output/implementer_${task_id}.status"
+            local output_file="$HIVE_DIR/runs/$run_id/output/implementer_${task_id}.txt"
+
+            local icon="${C_YELLOW}●${C_NC}"
+            local status="running"
+            local size="—"
+
+            if [ -f "$status_file" ]; then
+                local code=$(cat "$status_file")
+                if [ "$code" = "0" ]; then
+                    icon="${C_GREEN}✓${C_NC}"
+                    status="complete"
+                else
+                    icon="${C_RED}✗${C_NC}"
+                    status="failed"
+                fi
+            fi
+
+            if [ -f "$output_file" ]; then
+                size=$(wc -c < "$output_file" | tr -d ' ')
+                size="$((size / 1024))KB"
+            fi
+
+            # Get branch name
+            local branch_name="hive/task/${run_id}/${task_id}"
+
+            tui_goto $row 0
+            _row "  $icon ${C_BOLD}$task_id${C_NC}"
+            echo ""
+            row=$((row + 1))
+
+            tui_goto $row 0
+            _row "    ${C_DIM}Status:${C_NC} $status  ${C_DIM}Output:${C_NC} $size"
+            echo ""
+            row=$((row + 1))
+
+            tui_goto $row 0
+            _row "    ${C_DIM}Branch:${C_NC} ${C_CYAN}$branch_name${C_NC}"
+            echo ""
+            row=$((row + 1))
+
+            tui_goto $row 0
+            _row "    ${C_DIM}Path:${C_NC} $wt"
+            echo ""
+            row=$((row + 1))
+
+            tui_goto $row 0
+            _empty_row
+            echo ""
+            row=$((row + 1))
+
+            [ $row -ge $((TERM_ROWS - 5)) ] && break
+        done
+
+        if [ "$worktree_count" -eq 0 ]; then
+            tui_goto $row 0
+            _row "  ${C_DIM}No parallel worktrees active${C_NC}"
+            echo ""
+            row=$((row + 1))
+        fi
+    fi
+
+    tui_goto $((TERM_ROWS - 3)) 0
+    _empty_row
+    echo ""
+
+    render_footer $((TERM_ROWS - 2))
 }
 
 render_overview() {
@@ -480,22 +579,33 @@ _render_pipeline_at() {
     local run_id=$(get_current_run_id)
     local data=$(get_run_data)
     local current_agent=$(echo "$data" | jq -r '.current_agent // ""' 2>/dev/null)
-    
+
     tui_goto $row 0
     _hr_title "Pipeline"
     row=$((row + 1))
-    
+
     tui_goto $row 0
     _empty_row
     row=$((row + 1))
-    
-    for agent in architect implementer migrator ui-designer tester e2e-tester component-tester reviewer security debugger documenter; do
+
+    # Check for parallel worktrees
+    local worktree_dir="$HIVE_DIR/worktrees/$run_id"
+    local has_worktrees=false
+    local worktree_count=0
+
+    if [ -d "$worktree_dir" ]; then
+        worktree_count=$(ls -1d "$worktree_dir"/*/ 2>/dev/null | wc -l | tr -d ' ')
+        [ "$worktree_count" -gt 0 ] && has_worktrees=true
+    fi
+
+    for agent in architect implementer migrator ui-designer tester e2e-tester component-tester reviewer security debugger documenter comb; do
         local output_file="$HIVE_DIR/runs/$run_id/output/${agent}.txt"
+        local output_file_alt="$HIVE_DIR/runs/$run_id/output/${agent}_attempt_1.md"
 
         local icon="${C_DIM}○${C_NC}"
         local summary=""
 
-        if [ -f "$output_file" ]; then
+        if [ -f "$output_file" ] || [ -f "$output_file_alt" ]; then
             if [ "$agent" = "$current_agent" ]; then
                 icon="${C_YELLOW}●${C_NC}"
                 summary="Running..."
@@ -505,15 +615,77 @@ _render_pipeline_at() {
         fi
 
         # Only show agents that have output or are current
-        [ ! -f "$output_file" ] && [ "$agent" != "$current_agent" ] && continue
+        [ ! -f "$output_file" ] && [ ! -f "$output_file_alt" ] && [ "$agent" != "$current_agent" ] && continue
 
         tui_goto $row 0
         _row "  $icon $(printf '%-16s' "$agent")  ${C_DIM}$summary${C_NC}"
         row=$((row + 1))
+
+        # Show parallel worktrees after architect if they exist
+        if [ "$agent" = "architect" ] && [ "$has_worktrees" = "true" ]; then
+            tui_goto $row 0
+            _row "  ${C_CYAN}├─ Parallel Worktrees ($worktree_count)${C_NC}"
+            row=$((row + 1))
+
+            for wt_dir in "$worktree_dir"/*/; do
+                [ -d "$wt_dir" ] || continue
+                local task_id=$(basename "$wt_dir")
+                local wt_status_file="$HIVE_DIR/runs/$run_id/output/implementer_${task_id}.status"
+                local wt_icon="${C_YELLOW}●${C_NC}"
+                local wt_status="running"
+
+                if [ -f "$wt_status_file" ]; then
+                    local exit_code=$(cat "$wt_status_file")
+                    if [ "$exit_code" = "0" ]; then
+                        wt_icon="${C_GREEN}✓${C_NC}"
+                        wt_status="complete"
+                    else
+                        wt_icon="${C_RED}✗${C_NC}"
+                        wt_status="failed"
+                    fi
+                fi
+
+                tui_goto $row 0
+                _row "  ${C_DIM}│${C_NC}  $wt_icon $(printf '%-14s' "$task_id") ${C_DIM}$wt_status${C_NC}"
+                row=$((row + 1))
+
+                # Limit display
+                [ $row -ge $((TERM_ROWS - 12)) ] && break
+            done
+
+            tui_goto $row 0
+            _row "  ${C_DIM}└──${C_NC}"
+            row=$((row + 1))
+        fi
     done
-    
+
     tui_goto $row 0
     _empty_row
+}
+
+get_worktree_data() {
+    local run_id=$(get_current_run_id)
+    local worktree_dir="$HIVE_DIR/worktrees/$run_id"
+
+    if [ -d "$worktree_dir" ]; then
+        local result="["
+        local first=true
+        for wt in "$worktree_dir"/*/; do
+            [ -d "$wt" ] || continue
+            local task_id=$(basename "$wt")
+            local status_file="$HIVE_DIR/runs/$run_id/output/implementer_${task_id}.status"
+            local status="running"
+            if [ -f "$status_file" ]; then
+                local code=$(cat "$status_file")
+                [ "$code" = "0" ] && status="complete" || status="failed"
+            fi
+            [ "$first" = "true" ] && first=false || result="$result,"
+            result="$result{\"task_id\":\"$task_id\",\"status\":\"$status\"}"
+        done
+        echo "$result]"
+    else
+        echo "[]"
+    fi
 }
 
 _render_tasks_at() {
@@ -975,6 +1147,10 @@ handle_input() {
             CURRENT_VIEW="git"
             NEED_FULL_CLEAR=true
             ;;
+        7)
+            CURRENT_VIEW="worktrees"
+            NEED_FULL_CLEAR=true
+            ;;
     esac
 }
 
@@ -1003,6 +1179,9 @@ render() {
             ;;
         git)
             render_git_view
+            ;;
+        worktrees)
+            render_worktrees_view
             ;;
     esac
 }

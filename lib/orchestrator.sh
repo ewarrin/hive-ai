@@ -1524,6 +1524,16 @@ run_workflow() {
             fi
         fi
 
+        # Skip implementer if parallel worktree execution already completed
+        if [ "$phase_agent" = "implementer" ]; then
+            local parallel_done=$(scratchpad_get "parallel_impl_done" 2>/dev/null || echo "false")
+            if [ "$parallel_done" = "true" ]; then
+                print_info "Skipping implementer (parallel worktree execution completed)"
+                phase_num=$((phase_num + 1))
+                continue
+            fi
+        fi
+
         # Template variables
         phase_task="${phase_task//\{\{EPIC_ID\}\}/$epic_id}"
         [ -z "$phase_task" ] && phase_task="Execute your role for: $objective"
@@ -1639,7 +1649,55 @@ Continue anyway?"; then
         diff_snapshot "after_${phase_name}" "$run_id"
         index_update
         checkpoint_save "after_${phase_name}"
-        
+
+        # Check for parallel worktree execution after architect completes
+        if [ "$phase_agent" = "architect" ] && [ "${HIVE_WORKTREE_PARALLEL:-1}" = "1" ]; then
+            if worktree_available; then
+                local parallel_analysis=$(analyze_task_parallelism "$epic_id")
+                local parallel_count=$(echo "$parallel_analysis" | jq '.parallel | length')
+
+                if [ "$parallel_count" -gt 1 ]; then
+                    print_phase "Parallel Execution Detected"
+                    print_info "Found $parallel_count independent tasks - running in parallel worktrees"
+
+                    local parallel_tasks=$(echo "$parallel_analysis" | jq '.parallel')
+
+                    # Run parallel implementers in worktrees
+                    if worktree_run_parallel "$run_id" "$epic_id" "$parallel_tasks"; then
+                        print_success "All parallel tasks completed"
+
+                        # Get branches to merge
+                        local merge_branches=$(worktree_get_merge_branches "$run_id")
+
+                        if [ -n "$merge_branches" ]; then
+                            # Run comb agent to merge parallel work
+                            print_phase "Merging Parallel Work"
+                            local comb_task="Merge the following branches from parallel implementation:
+
+$(echo "$merge_branches" | while read -r branch; do echo "- $branch"; done)
+
+Each branch contains independent work from the architect's plan.
+Merge them into the main branch, resolving any conflicts."
+
+                            if run_agent_with_validation "comb" "$comb_task" ""; then
+                                print_success "Parallel work merged successfully"
+                                # Clean up worktrees
+                                worktree_cleanup_all "$run_id"
+                            else
+                                print_warn "Comb agent had issues merging"
+                            fi
+                        fi
+
+                        # Mark that we've handled parallel implementation
+                        scratchpad_set "parallel_impl_done" "true"
+                    else
+                        print_warn "Some parallel tasks failed"
+                        worktree_cleanup_all "$run_id"
+                    fi
+                fi
+            fi
+        fi
+
         # Git commit after successful agent
         if [ -n "$phase_agent" ]; then
             local agent_summary=$(selfeval_extract "$HIVE_DIR/runs/$run_id/output/${phase_agent}.txt" | jq -r '.summary // "Completed phase"' 2>/dev/null | head -c 50)
