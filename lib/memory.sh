@@ -27,6 +27,108 @@ memory_migrate_schema() {
             .pair_performance = (.pair_performance // {}) |
             .objective_patterns = (.objective_patterns // {})
         ' > "$MEMORY_FILE"
+        current=$(cat "$MEMORY_FILE")
+        version=1
+    fi
+
+    # v2: Add available_tools field
+    if [ "$version" -lt 2 ]; then
+        echo "$current" | jq '
+            .schema_version = 2 |
+            .available_tools = (.available_tools // [])
+        ' > "$MEMORY_FILE"
+    fi
+}
+
+# ============================================================================
+# Tool Environment Scanning
+# ============================================================================
+
+# Scan for available CLI tools in the environment
+memory_scan_tools() {
+    local tools=()
+
+    # Development tools
+    command -v docker &>/dev/null && tools+=("docker")
+    command -v docker-compose &>/dev/null && tools+=("docker-compose")
+    command -v kubectl &>/dev/null && tools+=("kubectl")
+    command -v helm &>/dev/null && tools+=("helm")
+
+    # Cloud CLIs
+    command -v aws &>/dev/null && tools+=("aws")
+    command -v gcloud &>/dev/null && tools+=("gcloud")
+    command -v az &>/dev/null && tools+=("az")
+    command -v vercel &>/dev/null && tools+=("vercel")
+    command -v netlify &>/dev/null && tools+=("netlify")
+    command -v fly &>/dev/null && tools+=("fly")
+
+    # Databases
+    command -v psql &>/dev/null && tools+=("psql")
+    command -v mysql &>/dev/null && tools+=("mysql")
+    command -v mongosh &>/dev/null && tools+=("mongosh")
+    command -v redis-cli &>/dev/null && tools+=("redis-cli")
+    command -v sqlite3 &>/dev/null && tools+=("sqlite3")
+
+    # Data tools
+    command -v bq &>/dev/null && tools+=("bq")
+    command -v jq &>/dev/null && tools+=("jq")
+    command -v yq &>/dev/null && tools+=("yq")
+    command -v csvkit &>/dev/null && tools+=("csvkit")
+
+    # Package managers
+    command -v npm &>/dev/null && tools+=("npm")
+    command -v yarn &>/dev/null && tools+=("yarn")
+    command -v pnpm &>/dev/null && tools+=("pnpm")
+    command -v pip &>/dev/null && tools+=("pip")
+    command -v cargo &>/dev/null && tools+=("cargo")
+    command -v go &>/dev/null && tools+=("go")
+
+    # AI CLIs
+    command -v claude &>/dev/null && tools+=("claude")
+    command -v codex &>/dev/null && tools+=("codex")
+
+    # Version control
+    command -v git &>/dev/null && tools+=("git")
+    command -v gh &>/dev/null && tools+=("gh")
+
+    # Build tools
+    command -v make &>/dev/null && tools+=("make")
+    command -v cmake &>/dev/null && tools+=("cmake")
+    command -v gradle &>/dev/null && tools+=("gradle")
+    command -v mvn &>/dev/null && tools+=("mvn")
+
+    # Convert to JSON array
+    local json_array="["
+    local first=true
+    for tool in "${tools[@]}"; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            json_array+=","
+        fi
+        json_array+="\"$tool\""
+    done
+    json_array+="]"
+
+    echo "$json_array"
+}
+
+# Update available tools in memory
+memory_update_tools() {
+    local tools=$(memory_scan_tools)
+    memory_update ".available_tools = $tools"
+}
+
+# Get available tools from memory
+memory_get_tools() {
+    memory_read | jq -r '.available_tools // []'
+}
+
+# Get tools as a human-readable string for agent context
+memory_get_tools_context() {
+    local tools=$(memory_get_tools | jq -r '.[]' 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+    if [ -n "$tools" ]; then
+        echo "You have access to these CLI tools: $tools"
     fi
 }
 
@@ -38,8 +140,9 @@ memory_migrate_schema() {
 memory_init() {
     if [ ! -f "$MEMORY_FILE" ]; then
         mkdir -p "$HIVE_DIR"
-        jq -n '{
-            schema_version: 1,
+        local tools=$(memory_scan_tools)
+        jq -n --argjson tools "$tools" '{
+            schema_version: 2,
             project: {
                 name: null,
                 type: null,
@@ -59,6 +162,7 @@ memory_init() {
             skip_patterns: {},
             pair_performance: {},
             objective_patterns: {},
+            available_tools: $tools,
             run_count: 0,
             created_at: (now | todate),
             updated_at: (now | todate)

@@ -11,6 +11,61 @@
 HIVE_DIR="${HIVE_DIR:-.hive}"
 
 # ============================================================================
+# Narrative Generation
+# ============================================================================
+
+# Generate a narrative summary of the run using LLM
+postmortem_generate_narrative() {
+    local run_id="$1"
+    local events_file="$HIVE_DIR/events.jsonl"
+    local scratchpad_file="$HIVE_DIR/scratchpad.json"
+
+    # Gather context for narrative
+    local objective=""
+    local decisions=""
+    local challenges=""
+    local agents_run=""
+    local blockers=""
+
+    if [ -f "$scratchpad_file" ]; then
+        objective=$(jq -r '.objective // "Unknown"' "$scratchpad_file")
+        decisions=$(jq -r '.decisions // [] | map("- \(.decision): \(.rationale // "")") | join("\n")' "$scratchpad_file" 2>/dev/null)
+        blockers=$(jq -r '.blockers // [] | map("- \(.blocker) (\(.agent))") | join("\n")' "$scratchpad_file" 2>/dev/null)
+    fi
+
+    if [ -f "$events_file" ]; then
+        agents_run=$(grep '"agent_complete"' "$events_file" 2>/dev/null | jq -r '.agent' | sort -u | tr '\n' ', ' | sed 's/,$//')
+        challenges=$(grep '"challenge"' "$events_file" 2>/dev/null | jq -r '"\(.from) challenged \(.to): \(.issue)"' 2>/dev/null | head -3)
+    fi
+
+    # Build prompt for narrative generation
+    local narrative_prompt="You are summarizing a software development workflow run. Write ONE paragraph (3-5 sentences) that a developer would want to read before starting their next task on this codebase. Be specific and useful, not generic.
+
+Objective: $objective
+Agents that ran: $agents_run
+Key decisions made:
+$decisions
+Challenges between agents:
+$challenges
+Blockers encountered:
+$blockers
+
+Write a brief, useful narrative summary. Focus on what was accomplished, any important decisions, and what someone should know before continuing work. Do NOT use bullet points - write flowing prose."
+
+    # Use haiku for cheap/fast narrative generation
+    if command -v claude &>/dev/null; then
+        local narrative=$(echo "$narrative_prompt" | claude -p --model haiku 2>/dev/null | head -20)
+        if [ -n "$narrative" ]; then
+            echo "$narrative"
+            return 0
+        fi
+    fi
+
+    # Fallback: generate a simple summary without LLM
+    echo "Completed workflow for: $objective. Agents: $agents_run."
+}
+
+# ============================================================================
 # Report Generation
 # ============================================================================
 
@@ -119,6 +174,9 @@ postmortem_generate() {
         blockers=$(jq -r '.blockers[] | "- [\(.status)] \(.blocker) (filed by \(.agent))"' "$scratchpad_file" 2>/dev/null || echo "")
     fi
     
+    # Generate narrative summary
+    local narrative=$(postmortem_generate_narrative "$run_id")
+
     # Build report
     cat > "$report_file" << REPORT
 # Hive Run Report
@@ -128,6 +186,12 @@ postmortem_generate() {
 **Objective:** $objective
 **Duration:** $duration
 **Date:** $(date -u +"%Y-%m-%d %H:%M UTC")
+
+---
+
+## What Happened
+
+$narrative
 
 ---
 

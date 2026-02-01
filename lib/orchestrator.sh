@@ -140,6 +140,13 @@ $(cat "$ctx_file")"
         done
     fi
 
+    # Common: available CLI tools (all agents benefit from knowing what's available)
+    local tools_ctx=$(memory_get_tools_context 2>/dev/null)
+    [ -n "$tools_ctx" ] && context="$context
+
+## Available Tools
+$tools_ctx"
+
     case "$agent" in
         architect)
             # Maximum context for planning - needs full picture
@@ -872,29 +879,103 @@ RETRY: Your previous response did not resolve the issue. Please:
 human_checkpoint() {
     local checkpoint_type="$1"
     local message="$2"
-    
+    local agent="${3:-}"
+    local report="${4:-}"
+
     if [ "${HIVE_AUTO_MODE:-0}" == "1" ]; then
         print_info "Auto-mode: skipping checkpoint ($checkpoint_type)"
         return 0
     fi
-    
+
     print_header "🛑 CHECKPOINT: $checkpoint_type"
     echo ""
-    echo "$message"
+
+    # Show evaluator verdicts if we have agent report data
+    if [ -n "$report" ] && [ "$report" != "{}" ]; then
+        local status=$(echo "$report" | jq -r '.status // "unknown"')
+        local confidence=$(echo "$report" | jq -r '.confidence // 0')
+        local summary=$(echo "$report" | jq -r '.summary // ""')
+        local files_count=$(echo "$report" | jq -r '.files_modified // [] | length')
+        local decisions_count=$(echo "$report" | jq -r '.decisions // [] | length')
+        local blockers=$(echo "$report" | jq -r '.blockers // []')
+        local concerns=$(echo "$report" | jq -r '.concerns // []')
+
+        # Completeness indicator
+        if [ "$status" = "complete" ]; then
+            echo -e "  ${GREEN}✓${NC} Completeness: Work reported as complete"
+        elif [ "$status" = "partial" ]; then
+            echo -e "  ${YELLOW}⚠${NC} Completeness: Partial - some work may be pending"
+        else
+            echo -e "  ${RED}✗${NC} Completeness: Status is $status"
+        fi
+
+        # Confidence indicator
+        local conf_pct=$(awk -v c="$confidence" 'BEGIN {printf "%d", c * 100}')
+        if [ "$conf_pct" -ge 80 ]; then
+            echo -e "  ${GREEN}✓${NC} Confidence: ${conf_pct}%"
+        elif [ "$conf_pct" -ge 60 ]; then
+            echo -e "  ${YELLOW}⚠${NC} Confidence: ${conf_pct}% (moderate)"
+        else
+            echo -e "  ${RED}✗${NC} Confidence: ${conf_pct}% (low)"
+        fi
+
+        # Risk indicator (based on concerns/blockers)
+        local blockers_count=$(echo "$blockers" | jq -r 'if type == "array" then length else 0 end')
+        local concerns_count=$(echo "$concerns" | jq -r 'if type == "array" then length else 0 end')
+        if [ "$blockers_count" -gt 0 ]; then
+            echo -e "  ${RED}✗${NC} Risk: $blockers_count blocker(s) reported"
+        elif [ "$concerns_count" -gt 0 ]; then
+            echo -e "  ${YELLOW}⚠${NC} Risk: $concerns_count concern(s) noted"
+        else
+            echo -e "  ${GREEN}✓${NC} Risk: No blockers or concerns"
+        fi
+
+        echo ""
+        echo -e "${DIM}────────────────────────────────────────${NC}"
+        echo ""
+
+        # Summary
+        if [ -n "$summary" ]; then
+            echo -e "${BOLD}Summary:${NC} $summary"
+        fi
+        if [ "$files_count" -gt 0 ]; then
+            echo -e "${DIM}Files modified: $files_count${NC}"
+        fi
+        if [ "$decisions_count" -gt 0 ]; then
+            echo -e "${DIM}Decisions made: $decisions_count${NC}"
+        fi
+    fi
+
+    # Show custom message if provided
+    if [ -n "$message" ]; then
+        echo ""
+        echo "$message"
+    fi
+
     echo ""
     echo -e "${DIM}────────────────────────────────────────${NC}"
-    
+
     log_human_checkpoint "$checkpoint_type" "$message"
-    
+
     while true; do
-        echo -e "${CYAN}[C]${NC}ontinue  ${CYAN}[S]${NC}cratchpad  ${CYAN}[B]${NC}eads  ${CYAN}[Q]${NC}uit"
+        echo -e "${CYAN}[C]${NC}ontinue  ${CYAN}[D]${NC}etails  ${CYAN}[S]${NC}cratchpad  ${CYAN}[B]${NC}eads  ${CYAN}[Q]${NC}uit"
         read -p "> " -n 1 -r REPLY < /dev/tty
         echo
-        
+
         case $REPLY in
             [Cc])
                 log_human_checkpoint "$checkpoint_type" "$message" "continue"
                 return 0
+                ;;
+            [Dd])
+                echo ""
+                if [ -n "$report" ] && [ "$report" != "{}" ]; then
+                    echo -e "${BOLD}Full Agent Report:${NC}"
+                    echo "$report" | jq .
+                else
+                    echo "(No detailed report available)"
+                fi
+                echo ""
                 ;;
             [Ss])
                 echo ""
@@ -1736,25 +1817,17 @@ Merge them into the main branch, resolving any conflicts."
         if [ "$checkpoint_after" == "true" ]; then
             # Get last agent's report for summary
             local last_output="$HIVE_DIR/runs/$run_id/output/${phase_agent}.txt"
-            local confidence=""
-            local summary=""
-            local files_modified=""
-            local issues=""
-            
+            local checkpoint_report="{}"
+
             if [ -f "$last_output" ]; then
                 local report=$(selfeval_extract "$last_output")
                 if [ -n "$report" ]; then
-                    confidence=$(echo "$report" | jq -r '.confidence // ""')
-                    summary=$(echo "$report" | jq -r '.summary // ""')
-                    files_modified=$(echo "$report" | jq -r '.files_modified // .files_created // "[]"')
-                    issues=$(echo "$report" | jq -r '.issues_found // .vulnerabilities // "[]"')
+                    checkpoint_report="$report"
                 fi
             fi
-            
-            # Show enhanced checkpoint display
-            progress_checkpoint_display "$phase_agent" "${confidence:-0.8}" "$files_modified" "$issues" "$summary"
-            
-            if ! human_checkpoint "${phase_name} Review" ""; then
+
+            # Enhanced checkpoint with evaluator verdicts
+            if ! human_checkpoint "${phase_name} Review" "" "$phase_agent" "$checkpoint_report"; then
                 rm -f "$phases_file"
                 return 1
             fi
