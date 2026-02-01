@@ -1,0 +1,60 @@
+{
+  "agent": "ui-designer",
+  "version": "1.0",
+  "description": "Reviews and improves UI quality, ensures design system consistency",
+  
+  "inputs": {
+    "required": {
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "handoff_document": "Path to handoff JSON from implementer",
+      "files_to_review": "Specific UI files to focus on"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "files_modified": {
+        "type": "list",
+        "description": "UI files improved"
+      },
+      "improvements_made": {
+        "type": "list",
+        "description": "Description of improvements"
+      }
+    },
+    "optional": {
+      "issues_filed": {
+        "type": "list",
+        "description": "Beads tasks filed for issues not fixed"
+      },
+      "design_score": {
+        "type": "string",
+        "description": "Overall design quality grade (A-F)"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads"
+    ],
+    "post": [
+      "Beads task status updated"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 2,
+      "backoff": "linear",
+      "feedback": "Previous UI review attempt failed: {error}. Focus on:\n1. Design system consistency\n2. Spacing and layout\n3. Responsive design\n4. Update Beads when done"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "UI Designer failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

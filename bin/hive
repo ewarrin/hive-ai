@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+# Hive v2 - AI Agent Orchestration CLI
+
+set -e
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+VERSION="2.0.0"
+HIVE_ROOT="${HIVE_ROOT:-$HOME/.hive}"
+HIVE_DIR="${HIVE_DIR:-.hive}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+# ============================================================================
+# Colors
+# ============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+print_logo() {
+    echo -e "${YELLOW}"
+    cat << 'LOGO'
+     __    __    __
+    /  \__/  \__/  \
+    \__/  \__/  \__/
+       \__/  \__/
+LOGO
+    echo -e "${NC}"
+    echo -e "${BOLD}${YELLOW}  H I V E${NC}  ${DIM}v$VERSION${NC}"
+    echo -e "${DIM}  AI Agent Orchestration${NC}"
+    echo ""
+}
+
+print_usage() {
+    echo "Usage: hive <command> [options]"
+    echo ""
+    echo -e "${BOLD}Commands:${NC}"
+    echo "  init                 Initialize Hive in current project"
+    echo "  run <objective>      Run a workflow"
+    echo "  resume [checkpoint]  Resume from checkpoint"
+    echo "  status               Show current/recent workflow status"
+    echo "  comb                 Weave work together, resolve merge conflicts"
+    echo "  doctor               Check setup and diagnose issues"
+    echo "  cost                 Show cost breakdown for runs"
+    echo "  findings             View/triage code review findings"
+    echo "  git                  Git integration (branch, commit, pr)"
+    echo "  events [options]     View event log"
+    echo "  checkpoints          List available checkpoints"
+    echo "  scratchpad           View current scratchpad"
+    echo "  contracts            List/validate agent contracts"
+    echo "  workflows            List available workflow templates"
+    echo "  memory               View project memory"
+    echo "  report [run_id]      View post-mortem report"
+    echo "  help                 Show this help message"
+    echo ""
+    echo -e "${BOLD}Run Options:${NC}"
+    echo "  -w, --workflow TYPE  Workflow: feature, bugfix, refactor, test, review, quick, docs"
+    echo "  -c, --context FILE   Include file as context (can be repeated)"
+    echo "  --only AGENT         Run single agent: architect, implementer, tester, reviewer, etc."
+    echo "  --no-interview       Skip clarification questions"
+    echo "  --auto               Autonomous mode (no human checkpoints)"
+    echo "  -v, --verbose        Verbose output"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo ""
+    echo "  # Start a new feature:"
+    echo "  hive run \"add user profile page with avatar upload\""
+    echo ""
+    echo "  # With a spec document:"
+    echo "  hive run \"implement the API\" -c docs/api-spec.md"
+    echo ""
+    echo "  # Quick fixes (minimal pipeline):"
+    echo "  hive run -w quick \"add loading spinner to dashboard\""
+    echo "  hive run -w bugfix \"fix login error when email has + symbol\""
+    echo ""
+    echo "  # Monitor in real-time (run in another terminal):"
+    echo "  hive status --tui"
+    echo ""
+    echo "  # Resolve conflicts after parallel work:"
+    echo "  hive comb"
+    echo ""
+    echo "  # Surgical multi-step workflow:"
+    echo "  hive run --only architect \"plan the auth module refactor\""
+    echo "  hive run --only implementer \"refactor auth to use JWT\""
+    echo "  hive run --only tester \"verify auth changes\""
+    echo ""
+    echo "  # Other commands:"
+    echo "  hive doctor            # Check setup"
+    echo "  hive cost --history    # View spending"
+    echo "  hive workflows         # List available workflows"
+    echo "  hive memory            # View what Hive learned"
+}
+
+check_dependencies() {
+    local missing=()
+    
+    if ! command -v jq &>/dev/null; then
+        missing+=("jq")
+    fi
+    
+    if ! command -v claude &>/dev/null; then
+        missing+=("claude (Claude Code CLI)")
+    fi
+    
+    if ! command -v bd &>/dev/null; then
+        missing+=("bd (Beads)")
+    fi
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Missing dependencies:${NC}"
+        for dep in "${missing[@]}"; do
+            echo "  - $dep"
+        done
+        echo ""
+        echo "Please install missing dependencies and try again."
+        exit 1
+    fi
+}
+
+check_initialized() {
+    if [ ! -d "$HIVE_DIR" ]; then
+        echo -e "${RED}Hive not initialized in this project.${NC}"
+        echo "Run 'hive init' first."
+        exit 1
+    fi
+}
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+cmd_init() {
+    print_logo
+    
+    echo "Initializing Hive..."
+    
+    check_dependencies
+    
+    mkdir -p "$HIVE_DIR"
+    mkdir -p "$HIVE_DIR/runs"
+    mkdir -p "$HIVE_DIR/handoffs"
+    mkdir -p "$HIVE_DIR/checkpoints"
+    mkdir -p "$HIVE_DIR/workflows"
+    mkdir -p "$HIVE_DIR/agents"
+    
+    # Initialize Beads if not already
+    if [ ! -d ".beads" ]; then
+        echo "Initializing Beads..."
+        bd init 2>/dev/null || true
+    fi
+    
+    # Initialize project memory
+    source "$LIB_DIR/memory.sh"
+    memory_init
+    memory_detect_project
+    
+    local framework=$(memory_read | jq -r '.project.framework // "unknown"')
+    local pkg=$(memory_read | jq -r '.project.package_manager // "unknown"')
+    if [ "$framework" != "null" ] && [ "$framework" != "unknown" ]; then
+        echo -e "${GREEN}✓${NC} Detected: $framework (${pkg})"
+    fi
+    
+    # Create initial event
+    source "$LIB_DIR/logger.sh"
+    log_event "hive_init" "$(jq -cn --arg v "$VERSION" '{version: $v}')"
+    
+    echo -e "${GREEN}✓${NC} Hive initialized in $HIVE_DIR"
+    echo ""
+    echo "Next steps:"
+    echo "  hive run \"your objective here\""
+    echo "  hive run -w bugfix \"fix the login error\""
+    echo "  hive workflows    # see all workflow types"
+}
+
+cmd_run() {
+    local objective=""
+    local workflow="feature"
+    local auto_mode=false
+    local only_agent=""
+    local context_files=()
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -w|--workflow)
+                workflow="$2"
+                shift 2
+                ;;
+            -c|--context)
+                if [ -f "$2" ]; then
+                    context_files+=("$2")
+                else
+                    echo -e "${RED}Error: Context file not found: $2${NC}"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --only)
+                only_agent="$2"
+                shift 2
+                ;;
+            --no-interview)
+                no_interview=true
+                shift
+                ;;
+            --auto)
+                auto_mode=true
+                shift
+                ;;
+            -v|--verbose)
+                export HIVE_VERBOSE=1
+                shift
+                ;;
+            -*)
+                echo "Unknown option: $1"
+                exit 1
+                ;;
+            *)
+                objective="$1"
+                shift
+                ;;
+        esac
+    done
+    
+    if [ -z "$objective" ]; then
+        echo -e "${RED}Error: No objective provided${NC}"
+        echo "Usage: hive run \"your objective\" [options]"
+        echo ""
+        echo "Options:"
+        echo "  -w, --workflow <name>   Workflow: feature, bugfix, refactor, test, review, quick"
+        echo "  -c, --context <file>    Include file as context (can be used multiple times)"
+        echo "  --only <agent>          Run only a specific agent"
+        echo "  --no-interview          Skip clarification questions"
+        echo "  --auto                  Auto-approve all prompts"
+        exit 1
+    fi
+    
+    # Export context files for orchestrator
+    if [ ${#context_files[@]} -gt 0 ]; then
+        export HIVE_CONTEXT_FILES="${context_files[*]}"
+        echo -e "${CYAN}ℹ${NC} Including context from: ${context_files[*]}"
+    fi
+    
+    print_logo
+    check_dependencies
+    check_initialized
+    
+    source "$LIB_DIR/orchestrator.sh"
+    
+    # Smart workflow selection if not explicitly specified
+    if [ "$workflow" = "feature" ]; then
+        source "$LIB_DIR/smart_select.sh"
+        local suggested=$(smart_select_workflow "$objective")
+        local confidence=$(smart_select_confidence "$objective" "$suggested")
+        
+        if [ "$suggested" != "feature" ] && [ "$confidence" -gt 60 ]; then
+            echo -e "${CYAN}ℹ${NC} Auto-selected workflow: ${BOLD}$suggested${NC} (${confidence}% confidence)"
+            local explanation=$(smart_select_explain "$objective" "$suggested")
+            echo -e "  ${DIM}$explanation${NC}"
+            echo ""
+            workflow="$suggested"
+        fi
+    fi
+    
+    if [ "$auto_mode" == "true" ]; then
+        export HIVE_AUTO_MODE=1
+    fi
+    
+    if [ "${no_interview:-}" == "true" ]; then
+        export HIVE_NO_INTERVIEW=1
+    fi
+    
+    if [ -n "$only_agent" ]; then
+        run_single_agent "$objective" "$only_agent"
+    else
+        run_workflow "$objective" "$workflow"
+    fi
+}
+
+cmd_comb() {
+    print_logo
+    check_dependencies
+    check_initialized
+    
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${BOLD}🍯 COMB - Weaving Work Together${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    # Check for conflicts or uncommitted changes
+    local has_conflicts=false
+    local has_changes=false
+    
+    if git diff --check 2>/dev/null | grep -q "conflict"; then
+        has_conflicts=true
+        echo -e "${YELLOW}⚠${NC}  Merge conflicts detected"
+    fi
+    
+    if grep -r "<<<<<<< " --include="*.ts" --include="*.tsx" --include="*.vue" --include="*.js" --include="*.jsx" . 2>/dev/null | head -1 | grep -q "."; then
+        has_conflicts=true
+        echo -e "${YELLOW}⚠${NC}  Conflict markers found in files"
+    fi
+    
+    if ! git diff --quiet 2>/dev/null; then
+        has_changes=true
+        echo -e "${CYAN}ℹ${NC}  Uncommitted changes detected"
+    fi
+    
+    if ! git diff --cached --quiet 2>/dev/null; then
+        has_changes=true
+        echo -e "${CYAN}ℹ${NC}  Staged changes detected"
+    fi
+    
+    # Check for hive branches
+    local hive_branches=$(git branch -a 2>/dev/null | grep "hive/" | wc -l | tr -d ' ')
+    if [ "$hive_branches" -gt 0 ]; then
+        echo -e "${CYAN}ℹ${NC}  $hive_branches hive branch(es) found"
+    fi
+    
+    echo ""
+    
+    if [ "$has_conflicts" = false ] && [ "$has_changes" = false ] && [ "$hive_branches" = "0" ]; then
+        echo -e "${GREEN}✓${NC} Nothing to comb - working tree is clean"
+        return 0
+    fi
+    
+    # Build context for refinery
+    local context="## Current State
+
+### Git Status
+\`\`\`
+$(git status --short 2>/dev/null)
+\`\`\`
+
+### Conflict Markers
+\`\`\`
+$(grep -r "<<<<<<< " --include="*.ts" --include="*.tsx" --include="*.vue" --include="*.js" -l . 2>/dev/null | head -10 || echo "None found")
+\`\`\`
+
+### Recent Commits
+\`\`\`
+$(git log --oneline -10 2>/dev/null)
+\`\`\`
+
+### Hive Branches
+\`\`\`
+$(git branch -a 2>/dev/null | grep "hive/" || echo "None")
+\`\`\`"
+
+    # Get recent objective from scratchpad
+    local objective=""
+    if [ -f "$HIVE_DIR/scratchpad.json" ]; then
+        objective=$(jq -r '.objective // ""' "$HIVE_DIR/scratchpad.json")
+    fi
+    
+    source "$LIB_DIR/orchestrator.sh"
+    
+    local task="Analyze the current git state and resolve any conflicts or integration issues.
+
+Recent objective: $objective
+
+$context
+
+Your task:
+1. Identify any merge conflicts or integration issues
+2. Resolve them while preserving the intent of each change
+3. Re-implement if necessary for cleaner code
+4. Ensure the build passes after resolution
+5. Commit the resolved state"
+
+    echo -e "${BOLD}Running Comb...${NC}"
+    echo ""
+    
+    run_single_agent "$task" "comb"
+}
+
+cmd_resume() {
+    local checkpoint_id="${1:-}"
+    
+    print_logo
+    check_dependencies
+    check_initialized
+    
+    source "$LIB_DIR/orchestrator.sh"
+    
+    resume_workflow "$checkpoint_id"
+}
+
+cmd_status() {
+    check_initialized
+    
+    source "$LIB_DIR/scratchpad.sh"
+    
+    if [ ! -f "$HIVE_DIR/scratchpad.json" ]; then
+        echo "No active workflow."
+        return
+    fi
+    
+    echo -e "${BOLD}Current Workflow Status${NC}"
+    echo ""
+    
+    local sp=$(scratchpad_read)
+    
+    echo -e "Run ID:     ${CYAN}$(echo "$sp" | jq -r '.run_id')${NC}"
+    echo -e "Epic:       ${CYAN}$(echo "$sp" | jq -r '.epic_id')${NC}"
+    echo -e "Objective:  $(echo "$sp" | jq -r '.objective')"
+    echo -e "Status:     $(echo "$sp" | jq -r '.status')"
+    echo -e "Phase:      $(echo "$sp" | jq -r '.current_phase')"
+    echo -e "Agent:      $(echo "$sp" | jq -r '.current_agent // "none"')"
+    echo ""
+    
+    local decisions=$(echo "$sp" | jq -r '.decisions[-3:]')
+    if [ "$decisions" != "[]" ] && [ "$decisions" != "null" ]; then
+        echo -e "${BOLD}Recent Decisions:${NC}"
+        echo "$decisions" | jq -r '.[] | "  - \(.decision)"'
+        echo ""
+    fi
+    
+    local blockers=$(echo "$sp" | jq '[.blockers[] | select(.status == "open")]')
+    if [ "$blockers" != "[]" ]; then
+        echo -e "${BOLD}${RED}Open Blockers:${NC}"
+        echo "$blockers" | jq -r '.[] | "  - \(.blocker)"'
+        echo ""
+    fi
+    
+    if command -v bd &>/dev/null; then
+        echo -e "${BOLD}Beads Tasks:${NC}"
+        bd list 2>/dev/null | head -10 || echo "  (unable to fetch)"
+    fi
+}
+
+cmd_events() {
+    check_initialized
+    
+    local tail_mode=false
+    local agent_filter=""
+    local event_filter=""
+    local count=20
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --tail|-f)
+                tail_mode=true
+                shift
+                ;;
+            --agent)
+                agent_filter="$2"
+                shift 2
+                ;;
+            --event)
+                event_filter="$2"
+                shift 2
+                ;;
+            -n)
+                count="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    
+    local events_file="$HIVE_DIR/events.jsonl"
+    
+    if [ ! -f "$events_file" ]; then
+        echo "No events recorded yet."
+        return
+    fi
+    
+    if [ "$tail_mode" == "true" ]; then
+        echo -e "${DIM}Following event log (Ctrl+C to stop)...${NC}"
+        tail -f "$events_file" | while read -r line; do
+            if [ -n "$agent_filter" ]; then
+                echo "$line" | jq -e "select(.agent == \"$agent_filter\")" 2>/dev/null && echo "$line" | jq -c '.'
+            elif [ -n "$event_filter" ]; then
+                echo "$line" | jq -e "select(.event == \"$event_filter\")" 2>/dev/null && echo "$line" | jq -c '.'
+            else
+                echo "$line" | jq -c '.'
+            fi
+        done
+    else
+        local filter="."
+        if [ -n "$agent_filter" ]; then
+            filter="select(.agent == \"$agent_filter\")"
+        elif [ -n "$event_filter" ]; then
+            filter="select(.event == \"$event_filter\")"
+        fi
+        
+        tail -n "$count" "$events_file" | while read -r line; do
+            echo "$line" | jq -c "$filter" 2>/dev/null || true
+        done
+    fi
+}
+
+cmd_checkpoints() {
+    check_initialized
+    
+    source "$LIB_DIR/checkpoint.sh"
+    
+    echo -e "${BOLD}Available Checkpoints${NC}"
+    echo ""
+    
+    local checkpoints=$(checkpoint_list)
+    
+    if [ "$checkpoints" == "[]" ]; then
+        echo "No checkpoints found."
+        return
+    fi
+    
+    echo "$checkpoints" | jq -r '.[] | "\(.checkpoint_id)  \(.created_at)  \(.phase // "?")  \(.reason // "")"' | \
+        while read -r line; do
+            echo "  $line"
+        done
+}
+
+cmd_scratchpad() {
+    check_initialized
+    
+    if [ ! -f "$HIVE_DIR/scratchpad.json" ]; then
+        echo "No scratchpad found."
+        return
+    fi
+    
+    cat "$HIVE_DIR/scratchpad.json" | jq .
+}
+
+cmd_contracts() {
+    local action="${1:-list}"
+    
+    case "$action" in
+        list)
+            echo -e "${BOLD}Available Contracts${NC}"
+            echo ""
+            ls -1 "$HIVE_ROOT/contracts"/*.json 2>/dev/null | while read -r file; do
+                local name=$(basename "$file" .json)
+                local version=$(jq -r '.version // "?"' "$file")
+                echo "  $name (v$version)"
+            done
+            ;;
+        validate)
+            source "$LIB_DIR/validator.sh"
+            local agent="${2:-all}"
+            
+            if [ "$agent" == "all" ]; then
+                for file in "$HIVE_ROOT/contracts"/*.json; do
+                    local name=$(basename "$file" .json)
+                    local result=$(contract_validate "$name")
+                    if [ "$result" == "Valid" ]; then
+                        echo -e "${GREEN}✓${NC} $name"
+                    else
+                        echo -e "${RED}✗${NC} $name: $result"
+                    fi
+                done
+            else
+                local result=$(contract_validate "$agent")
+                echo "$result"
+            fi
+            ;;
+        *)
+            echo "Usage: hive contracts [list|validate [agent]]"
+            ;;
+    esac
+}
+
+cmd_workflows() {
+    source "$LIB_DIR/workflow.sh"
+    
+    echo -e "${BOLD}Available Workflows${NC}"
+    echo ""
+    workflow_list
+    echo ""
+    echo "Usage: hive run -w <workflow> \"objective\""
+    echo ""
+    echo "Custom workflows: place JSON files in .hive/workflows/ or ~/.hive/workflows/"
+}
+
+cmd_memory() {
+    check_initialized
+    
+    source "$LIB_DIR/memory.sh"
+    
+    local action="${1:-show}"
+    
+    case "$action" in
+        show)
+            if [ ! -f "$HIVE_DIR/memory.json" ]; then
+                echo "No project memory yet. Run 'hive init' or complete a workflow."
+                return
+            fi
+            
+            echo -e "${BOLD}Project Memory${NC}"
+            echo ""
+            
+            local mem=$(memory_read)
+            
+            echo -e "${BOLD}Project:${NC}"
+            echo "$mem" | jq -r '.project | to_entries | map(select(.value != null and .value != "")) | .[] | "  \(.key): \(.value)"'
+            echo ""
+            
+            local tech=$(echo "$mem" | jq -r '.tech_stack | join(", ")')
+            if [ -n "$tech" ] && [ "$tech" != "" ]; then
+                echo -e "${BOLD}Tech Stack:${NC} $tech"
+                echo ""
+            fi
+            
+            local conventions=$(echo "$mem" | jq '.conventions | length')
+            if [ "$conventions" -gt 0 ] 2>/dev/null; then
+                echo -e "${BOLD}Conventions:${NC}"
+                echo "$mem" | jq -r '.conventions[] | "  - \(.)"'
+                echo ""
+            fi
+            
+            local gotchas=$(echo "$mem" | jq '.gotchas | length')
+            if [ "$gotchas" -gt 0 ] 2>/dev/null; then
+                echo -e "${BOLD}Gotchas:${NC}"
+                echo "$mem" | jq -r '.gotchas[] | "  - \(.)"'
+                echo ""
+            fi
+            
+            local runs=$(echo "$mem" | jq '.run_count')
+            echo -e "${BOLD}Total Runs:${NC} $runs"
+            
+            local agent_count=$(echo "$mem" | jq '.agent_history | length')
+            if [ "$agent_count" -gt 0 ] 2>/dev/null; then
+                echo ""
+                echo -e "${BOLD}Agent History (last 10):${NC}"
+                echo "$mem" | jq -r '.agent_history[-10:] | .[] | "  \(.agent): \(.duration)s, \(if .success then "✓" else "✗" end), \(.attempts) attempt(s)"'
+            fi
+            ;;
+        
+        detect)
+            memory_detect_project
+            echo -e "${GREEN}✓${NC} Project re-scanned"
+            cmd_memory show
+            ;;
+        
+        add-convention)
+            shift
+            local convention="$*"
+            if [ -z "$convention" ]; then
+                echo "Usage: hive memory add-convention \"convention text\""
+                return
+            fi
+            memory_add_convention "$convention"
+            echo -e "${GREEN}✓${NC} Added convention: $convention"
+            ;;
+        
+        add-gotcha)
+            shift
+            local gotcha="$*"
+            if [ -z "$gotcha" ]; then
+                echo "Usage: hive memory add-gotcha \"gotcha text\""
+                return
+            fi
+            memory_add_gotcha "$gotcha"
+            echo -e "${GREEN}✓${NC} Added gotcha: $gotcha"
+            ;;
+        
+        reset)
+            rm -f "$HIVE_DIR/memory.json"
+            memory_init
+            memory_detect_project
+            echo -e "${GREEN}✓${NC} Memory reset and re-scanned"
+            ;;
+        
+        *)
+            echo "Usage: hive memory [show|detect|add-convention|add-gotcha|reset]"
+            ;;
+    esac
+}
+
+cmd_report() {
+    check_initialized
+    
+    local run_id="${1:-}"
+    
+    # Find latest run if not specified
+    if [ -z "$run_id" ]; then
+        run_id=$(ls -1 "$HIVE_DIR/runs" 2>/dev/null | sort -r | head -1)
+    fi
+    
+    if [ -z "$run_id" ]; then
+        echo "No runs found."
+        return
+    fi
+    
+    local report_file="$HIVE_DIR/runs/$run_id/report.md"
+    
+    if [ ! -f "$report_file" ]; then
+        echo "No report found for run $run_id"
+        echo ""
+        echo "Available runs:"
+        ls -1 "$HIVE_DIR/runs" 2>/dev/null | while read -r r; do
+            local has_report=""
+            [ -f "$HIVE_DIR/runs/$r/report.md" ] && has_report=" (has report)"
+            echo "  $r$has_report"
+        done
+        return
+    fi
+    
+    cat "$report_file"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local command="${1:-help}"
+    shift || true
+    
+    case "$command" in
+        init)
+            cmd_init "$@"
+            ;;
+        run)
+            cmd_run "$@"
+            ;;
+        resume)
+            cmd_resume "$@"
+            ;;
+        status)
+            "$SCRIPT_DIR/hive-status" "$@"
+            ;;
+        doctor)
+            "$SCRIPT_DIR/hive-doctor" "$@"
+            ;;
+        cost)
+            "$SCRIPT_DIR/hive-cost" "$@"
+            ;;
+        findings)
+            "$SCRIPT_DIR/hive-findings" "$@"
+            ;;
+        git)
+            "$SCRIPT_DIR/hive-git" "$@"
+            ;;
+        refine|merge|comb)
+            cmd_comb "$@"
+            ;;
+        events)
+            cmd_events "$@"
+            ;;
+        checkpoints)
+            cmd_checkpoints "$@"
+            ;;
+        scratchpad)
+            cmd_scratchpad "$@"
+            ;;
+        contracts)
+            cmd_contracts "$@"
+            ;;
+        workflows)
+            cmd_workflows "$@"
+            ;;
+        memory)
+            cmd_memory "$@"
+            ;;
+        report)
+            cmd_report "$@"
+            ;;
+        help|--help|-h)
+            print_logo
+            print_usage
+            ;;
+        version|--version|-V)
+            echo "Hive v$VERSION"
+            ;;
+        *)
+            echo -e "${RED}Unknown command: $command${NC}"
+            echo ""
+            print_usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

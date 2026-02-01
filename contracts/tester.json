@@ -1,0 +1,61 @@
+{
+  "agent": "tester",
+  "version": "1.0",
+  "description": "Writes and runs tests, files bugs for failures",
+  
+  "inputs": {
+    "required": {
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "handoff_document": "Path to handoff JSON from implementer",
+      "files_to_test": "Specific files to focus testing on"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "tests_written": {
+        "type": "list",
+        "description": "Test files created or modified"
+      },
+      "test_results": {
+        "type": "object",
+        "description": "Summary of test run (passed, failed, skipped)"
+      },
+      "bugs_filed": {
+        "type": "list",
+        "description": "Beads bug IDs filed for failures"
+      }
+    },
+    "optional": {
+      "coverage_report": {
+        "type": "object",
+        "description": "Code coverage statistics"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads"
+    ],
+    "post": [
+      "Beads task status updated",
+      "All test failures have corresponding bug filed"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 3,
+      "backoff": "linear",
+      "feedback": "Previous testing attempt failed: {error}. Ensure you:\n1. Update Beads task status\n2. File bugs for any test failures\n3. Close your task when done"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Tester failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

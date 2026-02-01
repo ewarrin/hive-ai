@@ -1,0 +1,61 @@
+{
+  "agent": "reviewer",
+  "version": "1.0",
+  "description": "Reviews code for quality, security, and best practices",
+  
+  "inputs": {
+    "required": {
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "files_to_review": "Specific files to focus review on",
+      "review_focus": "Areas to focus on (security, performance, etc.)"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "issues_filed": {
+        "type": "list",
+        "description": "Beads issue IDs filed (BLOCKING, IMPORTANT, NITPICK)"
+      },
+      "review_summary": {
+        "type": "string",
+        "description": "Overall review summary"
+      }
+    },
+    "optional": {
+      "blocking_count": {
+        "type": "number",
+        "description": "Number of blocking issues"
+      },
+      "approval_status": {
+        "type": "enum",
+        "values": ["approved", "changes_requested", "blocked"],
+        "description": "Whether code is ready to ship"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads"
+    ],
+    "post": [
+      "Beads task status updated"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 2,
+      "backoff": "linear",
+      "feedback": "Previous review attempt failed: {error}. Ensure you:\n1. File ALL issues in Beads (not just mention them)\n2. Categorize by severity (BLOCKING, IMPORTANT, NITPICK)\n3. Close your review task when done"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Reviewer failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

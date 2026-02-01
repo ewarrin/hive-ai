@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# Hive Status - Show current/recent run status
+#
+# Usage: hive status [--watch] [--tui] [--json] [--run <run_id>]
+
+set -e
+
+HIVE_DIR="${HIVE_DIR:-.hive}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ============================================================================
+# Colors
+# ============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Box drawing
+BOX_TL='╭'
+BOX_TR='╮'
+BOX_BL='╰'
+BOX_BR='╯'
+BOX_H='─'
+BOX_V='│'
+BOX_VR='├'
+BOX_VL='┤'
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+_box_row() {
+    local content="$1"
+    local plain_content=$(echo -e "$content" | sed 's/\x1b\[[0-9;]*m//g')
+    local len=${#plain_content}
+    local padding=$((51 - len))
+    [ $padding -lt 0 ] && padding=0
+    printf "${CYAN}${BOX_V}${NC}  %b%*s${CYAN}${BOX_V}${NC}\n" "$content" "$padding" ""
+}
+
+_format_duration() {
+    local seconds=$1
+    if [ "$seconds" -lt 60 ]; then
+        echo "${seconds}s"
+    elif [ "$seconds" -lt 3600 ]; then
+        local mins=$((seconds / 60))
+        local secs=$((seconds % 60))
+        echo "${mins}m ${secs}s"
+    else
+        local hours=$((seconds / 3600))
+        local mins=$(((seconds % 3600) / 60))
+        echo "${hours}h ${mins}m"
+    fi
+}
+
+_relative_time() {
+    local timestamp=$1
+    local now=$(date +%s)
+    local diff=$((now - timestamp))
+    
+    if [ $diff -lt 5 ]; then
+        echo "just now"
+    elif [ $diff -lt 60 ]; then
+        echo "${diff}s ago"
+    elif [ $diff -lt 3600 ]; then
+        echo "$((diff / 60))m ago"
+    elif [ $diff -lt 86400 ]; then
+        echo "$((diff / 3600))h ago"
+    else
+        echo "$((diff / 86400))d ago"
+    fi
+}
+
+_status_icon() {
+    local status=$1
+    case "$status" in
+        running|in_progress)
+            echo -e "${GREEN}●${NC}"
+            ;;
+        complete|closed)
+            echo -e "${GREEN}✓${NC}"
+            ;;
+        failed|error)
+            echo -e "${RED}✗${NC}"
+            ;;
+        blocked)
+            echo -e "${RED}◌${NC}"
+            ;;
+        waiting|pending)
+            echo -e "${YELLOW}○${NC}"
+            ;;
+        *)
+            echo -e "${DIM}○${NC}"
+            ;;
+    esac
+}
+
+# ============================================================================
+# Get Status Data
+# ============================================================================
+
+get_current_run() {
+    # Find most recent run directory
+    local latest=""
+    local latest_time=0
+    
+    if [ -d "$HIVE_DIR/runs" ]; then
+        for run_dir in "$HIVE_DIR/runs"/*/; do
+            [ -d "$run_dir" ] || continue
+            local run_id=$(basename "$run_dir")
+            [[ "$run_id" == *_subagents ]] && continue
+            
+            local scratchpad="$run_dir/../scratchpad.json"
+            [ -f "$HIVE_DIR/scratchpad.json" ] && scratchpad="$HIVE_DIR/scratchpad.json"
+            
+            if [ -f "$scratchpad" ]; then
+                local mtime=$(stat -c %Y "$scratchpad" 2>/dev/null || stat -f %m "$scratchpad" 2>/dev/null || echo "0")
+                if [ "$mtime" -gt "$latest_time" ]; then
+                    latest_time=$mtime
+                    latest=$run_id
+                fi
+            fi
+        done
+    fi
+    
+    echo "$latest"
+}
+
+get_run_status() {
+    local run_id=$1
+    
+    local scratchpad="$HIVE_DIR/scratchpad.json"
+    if [ ! -f "$scratchpad" ]; then
+        echo "{}"
+        return
+    fi
+    
+    cat "$scratchpad"
+}
+
+get_task_counts() {
+    if command -v bd &>/dev/null; then
+        local tasks=$(bd list --json 2>/dev/null || echo "[]")
+        local open=$(echo "$tasks" | jq '[.[] | select(.status == "open" or .status == "ready")] | length' 2>/dev/null || echo "0")
+        local closed=$(echo "$tasks" | jq '[.[] | select(.status == "closed")] | length' 2>/dev/null || echo "0")
+        local blocked=$(echo "$tasks" | jq '[.[] | select(.status == "blocked")] | length' 2>/dev/null || echo "0")
+        local in_progress=$(echo "$tasks" | jq '[.[] | select(.status == "in_progress")] | length' 2>/dev/null || echo "0")
+        echo "$open|$closed|$blocked|$in_progress"
+    else
+        echo "0|0|0|0"
+    fi
+}
+
+get_last_activity() {
+    local run_id=$1
+    local output_dir="$HIVE_DIR/runs/$run_id/output"
+    
+    if [ -d "$output_dir" ]; then
+        local latest_file=$(ls -t "$output_dir"/*.txt 2>/dev/null | head -1)
+        if [ -n "$latest_file" ] && [ -f "$latest_file" ]; then
+            local mtime=$(stat -c %Y "$latest_file" 2>/dev/null || stat -f %m "$latest_file" 2>/dev/null || echo "0")
+            local agent=$(basename "$latest_file" .txt)
+            # Get last meaningful line
+            local last_line=$(grep -E "^(Writing|Reading|Creating|Running|✓|✗|bd |npm |cargo )" "$latest_file" 2>/dev/null | tail -1 | head -c 45)
+            echo "$mtime|$agent|$last_line"
+            return
+        fi
+    fi
+    echo "0||"
+}
+
+# ============================================================================
+# Display
+# ============================================================================
+
+print_status() {
+    local run_id=$1
+    local status_json=$2
+    
+    local objective=$(echo "$status_json" | jq -r '.objective // "Unknown"' 2>/dev/null)
+    local status=$(echo "$status_json" | jq -r '.status // "unknown"' 2>/dev/null)
+    local agent=$(echo "$status_json" | jq -r '.current_agent // ""' 2>/dev/null)
+    local phase=$(echo "$status_json" | jq -r '.phase // ""' 2>/dev/null)
+    local epic_id=$(echo "$status_json" | jq -r '.epic_id // ""' 2>/dev/null)
+    local start_time=$(echo "$status_json" | jq -r '.start_time // 0' 2>/dev/null)
+    
+    # Calculate elapsed
+    local elapsed="—"
+    if [ "$start_time" != "0" ] && [ "$start_time" != "null" ] && [ -n "$start_time" ]; then
+        local now=$(date +%s)
+        local elapsed_secs=$((now - start_time))
+        elapsed=$(_format_duration $elapsed_secs)
+    fi
+    
+    # Get task counts
+    IFS='|' read -r open closed blocked in_progress <<< "$(get_task_counts)"
+    
+    # Get last activity
+    IFS='|' read -r activity_time activity_agent activity_line <<< "$(get_last_activity "$run_id")"
+    local activity_ago=""
+    if [ "$activity_time" != "0" ] && [ -n "$activity_time" ]; then
+        activity_ago=$(_relative_time $activity_time)
+    fi
+    
+    # Truncate objective if needed
+    if [ ${#objective} -gt 42 ]; then
+        objective="${objective:0:39}..."
+    fi
+    
+    # Print box
+    echo ""
+    printf "${CYAN}${BOX_TL}${BOX_H} Hive Status "
+    printf "${BOX_H}%.0s" {1..40}
+    printf "${BOX_TR}${NC}\n"
+    
+    _box_row ""
+    
+    # Run ID and status
+    local status_display=""
+    case "$status" in
+        running|in_progress)
+            status_display="${GREEN}● Running${NC}"
+            ;;
+        complete)
+            status_display="${GREEN}✓ Complete${NC}"
+            ;;
+        failed|error)
+            status_display="${RED}✗ Failed${NC}"
+            ;;
+        blocked)
+            status_display="${YELLOW}◌ Blocked${NC}"
+            ;;
+        *)
+            status_display="${DIM}○ $status${NC}"
+            ;;
+    esac
+    
+    _box_row "${DIM}Run:${NC}     ${BOLD}$run_id${NC}"
+    _box_row "${DIM}Status:${NC}  $status_display"
+    _box_row "${DIM}Elapsed:${NC} ${BOLD}$elapsed${NC}"
+    
+    _box_row ""
+    
+    # Current agent/phase
+    if [ -n "$agent" ] && [ "$agent" != "null" ]; then
+        _box_row "${DIM}Agent:${NC}   ${CYAN}$agent${NC} ${DIM}($phase)${NC}"
+    fi
+    
+    # Objective
+    _box_row "${DIM}Task:${NC}    $objective"
+    
+    _box_row ""
+    
+    # Task counts
+    local task_line="${YELLOW}○${NC} $open open  ${GREEN}●${NC} $closed closed"
+    [ "$blocked" -gt 0 ] && task_line="$task_line  ${RED}◌${NC} $blocked blocked"
+    [ "$in_progress" -gt 0 ] && task_line="$task_line  ${CYAN}◐${NC} $in_progress active"
+    _box_row "${DIM}Tasks:${NC}   $task_line"
+    
+    _box_row ""
+    
+    # Last activity
+    if [ -n "$activity_line" ]; then
+        _box_row "${DIM}Last:${NC}    $activity_line"
+        _box_row "         ${DIM}$activity_ago${NC}"
+    fi
+    
+    _box_row ""
+    
+    printf "${CYAN}${BOX_BL}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_BR}${NC}\n"
+    
+    echo ""
+    echo -e "${DIM}Tip: Run in another terminal while workflow executes${NC}"
+    echo ""
+}
+
+print_no_runs() {
+    echo ""
+    printf "${CYAN}${BOX_TL}${BOX_H} Hive Status "
+    printf "${BOX_H}%.0s" {1..40}
+    printf "${BOX_TR}${NC}\n"
+    
+    _box_row ""
+    _box_row "${DIM}No active or recent runs found.${NC}"
+    _box_row ""
+    _box_row "Start a workflow with:"
+    _box_row "  ${CYAN}hive run \"your objective\"${NC}"
+    _box_row ""
+    
+    printf "${CYAN}${BOX_BL}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_BR}${NC}\n"
+    echo ""
+}
+
+print_recent_runs() {
+    echo ""
+    echo -e "${BOLD}Recent Runs${NC}"
+    echo -e "${DIM}───────────${NC}"
+    
+    local count=0
+    for run_dir in $(ls -td "$HIVE_DIR/runs"/*/ 2>/dev/null | head -5); do
+        [ -d "$run_dir" ] || continue
+        local run_id=$(basename "$run_dir")
+        [[ "$run_id" == *_subagents ]] && continue
+        
+        local scratchpad="$HIVE_DIR/scratchpad.json"
+        if [ -f "$scratchpad" ]; then
+            local status=$(jq -r '.status // "unknown"' "$scratchpad" 2>/dev/null)
+            local objective=$(jq -r '.objective // "—"' "$scratchpad" 2>/dev/null | head -c 40)
+            
+            echo -e "  $(_status_icon $status) ${BOLD}$run_id${NC}  $objective"
+            count=$((count + 1))
+        fi
+    done
+    
+    [ $count -eq 0 ] && echo -e "  ${DIM}No runs found${NC}"
+    echo ""
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local watch_mode=false
+    local json_mode=false
+    local tui_mode=false
+    local run_id=""
+    
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --watch|-w)
+                watch_mode=true
+                shift
+                ;;
+            --tui|-t)
+                tui_mode=true
+                shift
+                ;;
+            --json)
+                json_mode=true
+                shift
+                ;;
+            --run|-r)
+                run_id="$2"
+                shift 2
+                ;;
+            --recent)
+                print_recent_runs
+                exit 0
+                ;;
+            -h|--help)
+                echo "Usage: hive status [--watch] [--tui] [--json] [--run <run_id>] [--recent]"
+                echo ""
+                echo "Options:"
+                echo "  -w, --watch    Continuously update status"
+                echo "  -t, --tui      Launch interactive TUI"
+                echo "  --json         Output in JSON format"
+                echo "  -r, --run      Show status for specific run"
+                echo "  --recent       List recent runs"
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    
+    # Launch TUI if requested
+    if [ "$tui_mode" = true ]; then
+        # Prefer Go TUI if available (faster)
+        if [ -x "$SCRIPT_DIR/hive-tui" ]; then
+            exec "$SCRIPT_DIR/hive-tui"
+        else
+            exec "$SCRIPT_DIR/hive-status-tui"
+        fi
+    fi
+    
+    # Get run ID if not specified
+    if [ -z "$run_id" ]; then
+        run_id=$(get_current_run)
+    fi
+    
+    if [ -z "$run_id" ]; then
+        print_no_runs
+        exit 0
+    fi
+    
+    # Get and display status
+    local status_json=$(get_run_status "$run_id")
+    
+    if [ "$json_mode" = true ]; then
+        echo "$status_json" | jq .
+    elif [ "$watch_mode" = true ]; then
+        while true; do
+            clear
+            status_json=$(get_run_status "$run_id")
+            print_status "$run_id" "$status_json"
+            sleep 2
+        done
+    else
+        print_status "$run_id" "$status_json"
+    fi
+}
+
+main "$@"

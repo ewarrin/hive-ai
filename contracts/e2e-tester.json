@@ -1,0 +1,60 @@
+{
+  "agent": "e2e-tester",
+  "version": "1.0",
+  "description": "Writes and runs end-to-end tests with Playwright",
+  
+  "inputs": {
+    "required": {
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "handoff_document": "Path to handoff JSON",
+      "user_flows": "Specific user flows to test"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "tests_written": {
+        "type": "list",
+        "description": "E2E test files created"
+      },
+      "test_results": {
+        "type": "object",
+        "description": "Summary of test run"
+      },
+      "bugs_filed": {
+        "type": "list",
+        "description": "Beads bug IDs for failures"
+      }
+    },
+    "optional": {
+      "screenshots": {
+        "type": "list",
+        "description": "Visual regression screenshots"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads"
+    ],
+    "post": [
+      "Beads task status updated"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 2,
+      "backoff": "linear",
+      "feedback": "Previous E2E testing failed: {error}. Ensure:\n1. Playwright is installed\n2. App is running for tests\n3. Update Beads when done"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "E2E Tester failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

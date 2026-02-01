@@ -1,0 +1,67 @@
+{
+  "agent": "security",
+  "version": "1.0",
+  "description": "Reviews code for security vulnerabilities and misconfigurations",
+  
+  "inputs": {
+    "required": {
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "files_to_review": "Specific files to focus review on",
+      "focus_areas": "Specific areas: auth, injection, xss, data_exposure, config"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "security_score": {
+        "type": "enum",
+        "values": ["A", "B", "C", "D", "F"],
+        "description": "Overall security grade"
+      },
+      "vulnerabilities": {
+        "type": "list",
+        "description": "Security issues found with severity and fix recommendations"
+      }
+    },
+    "optional": {
+      "critical_count": {
+        "type": "number",
+        "description": "Number of critical vulnerabilities"
+      },
+      "high_count": {
+        "type": "number",
+        "description": "Number of high severity vulnerabilities"
+      },
+      "deploy_safe": {
+        "type": "boolean",
+        "description": "Whether code is safe to deploy"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads",
+      "Code changes exist to review"
+    ],
+    "post": [
+      "All critical/high issues have fix recommendations",
+      "Security score reflects findings"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 2,
+      "backoff": "linear",
+      "feedback": "Previous security review failed: {error}. Ensure you:\n1. Check all OWASP Top 10 categories\n2. Provide severity for each finding\n3. Include specific fix recommendations"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Security review failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

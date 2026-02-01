@@ -1,0 +1,66 @@
+{
+  "agent": "architect",
+  "version": "1.0",
+  "description": "Designs solutions and creates tasks in Beads",
+  
+  "inputs": {
+    "required": {
+      "objective": "The goal to design a solution for",
+      "epic_id": "Beads epic ID to create tasks under"
+    },
+    "optional": {
+      "constraints": "Any constraints or requirements",
+      "existing_context": "Information about existing codebase"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "tasks_created": {
+        "type": "list",
+        "description": "Beads task IDs created"
+      },
+      "design_summary": {
+        "type": "string",
+        "description": "Summary of the design approach"
+      }
+    },
+    "optional": {
+      "decisions": {
+        "type": "list",
+        "description": "Key decisions made"
+      },
+      "risks": {
+        "type": "list",
+        "description": "Identified risks"
+      },
+      "open_questions": {
+        "type": "list",
+        "description": "Questions needing human input"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads"
+    ],
+    "post": [
+      "Tasks created in Beads",
+      "Scratchpad updated with decisions/context"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 3,
+      "backoff": "linear",
+      "feedback": "Previous design attempt failed: {error}. Please try again, ensuring you create tasks in Beads."
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Architect failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

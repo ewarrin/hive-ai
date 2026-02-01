@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# Hive Cost - Show cost information
+#
+# Usage: hive cost [--run <run_id>] [--history] [--json]
+
+set -e
+
+HIVE_ROOT="${HIVE_ROOT:-$HOME/.hive}"
+HIVE_DIR="${HIVE_DIR:-.hive}"
+
+# Source cost library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/cost.sh"
+
+# ============================================================================
+# Colors
+# ============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Box drawing
+BOX_TL='╭'
+BOX_TR='╮'
+BOX_BL='╰'
+BOX_BR='╯'
+BOX_H='─'
+BOX_V='│'
+BOX_VR='├'
+BOX_VL='┤'
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+_box_row() {
+    local content="$1"
+    local plain_content=$(echo -e "$content" | sed 's/\x1b\[[0-9;]*m//g')
+    local len=${#plain_content}
+    local padding=$((51 - len))
+    [ $padding -lt 0 ] && padding=0
+    printf "${CYAN}${BOX_V}${NC}  %b%*s${CYAN}${BOX_V}${NC}\n" "$content" "$padding" ""
+}
+
+get_current_run() {
+    local latest=""
+    if [ -d "$HIVE_DIR/runs" ]; then
+        local latest_dir=$(ls -td "$HIVE_DIR/runs"/*/ 2>/dev/null | grep -v _subagents | head -1)
+        [ -n "$latest_dir" ] && latest=$(basename "$latest_dir")
+    fi
+    echo "$latest"
+}
+
+# ============================================================================
+# Display
+# ============================================================================
+
+print_run_cost() {
+    local run_id="$1"
+    local cost_file="$HIVE_DIR/runs/$run_id/cost.json"
+    
+    if [ ! -f "$cost_file" ]; then
+        echo ""
+        echo -e "${YELLOW}No cost data for run: $run_id${NC}"
+        echo -e "${DIM}Cost tracking starts when agents run.${NC}"
+        echo ""
+        return
+    fi
+    
+    local data=$(cat "$cost_file")
+    
+    local total_input=$(echo "$data" | jq -r '.total_input_tokens // 0')
+    local total_output=$(echo "$data" | jq -r '.total_output_tokens // 0')
+    local total_cost=$(echo "$data" | jq -r '.total_cost_usd // 0')
+    
+    echo ""
+    printf "${CYAN}${BOX_TL}${BOX_H} Cost: $run_id "
+    local title_len=$((${#run_id} + 8))
+    local remaining=$((52 - title_len))
+    printf "${BOX_H}%.0s" $(seq 1 $remaining)
+    printf "${BOX_TR}${NC}\n"
+    
+    _box_row ""
+    
+    # Agent breakdown
+    _box_row "${BOLD}Agents${NC}"
+    
+    echo "$data" | jq -r '
+        .agents | to_entries | sort_by(.value.cost_usd) | reverse | .[] |
+        "\(.key)|\(.value.cost_usd)|\(.value.input_tokens)|\(.value.output_tokens)|\(.value.calls)"
+    ' 2>/dev/null | while IFS='|' read agent cost input output calls; do
+        local cost_fmt=$(format_cost "$cost")
+        local input_fmt=$(format_tokens "$input")
+        local output_fmt=$(format_tokens "$output")
+        _box_row "  ${CYAN}$agent${NC}"
+        _box_row "    ${GREEN}$cost_fmt${NC} ${DIM}│${NC} ${input_fmt} in ${DIM}/${NC} ${output_fmt} out ${DIM}│${NC} x$calls"
+    done
+    
+    # Sub-agent breakdown if exists
+    local sub_count=$(echo "$data" | jq '.sub_agents | length' 2>/dev/null || echo "0")
+    if [ "$sub_count" -gt 0 ]; then
+        _box_row ""
+        _box_row "${BOLD}Sub-Agents${NC}"
+        
+        echo "$data" | jq -r '
+            .sub_agents | to_entries | sort_by(.value.cost_usd) | reverse | .[] |
+            "\(.key)|\(.value.cost_usd)|\(.value.input_tokens)|\(.value.output_tokens)|\(.value.calls)"
+        ' 2>/dev/null | while IFS='|' read agent cost input output calls; do
+            local cost_fmt=$(format_cost "$cost")
+            local input_fmt=$(format_tokens "$input")
+            local output_fmt=$(format_tokens "$output")
+            _box_row "  ${DIM}$agent${NC}"
+            _box_row "    ${DIM}$cost_fmt │ ${input_fmt} in / ${output_fmt} out │ x$calls${NC}"
+        done
+    fi
+    
+    _box_row ""
+    printf "${CYAN}${BOX_VR}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_VL}${NC}\n"
+    
+    # Totals
+    _box_row ""
+    _box_row "${DIM}Input tokens:${NC}   $(format_tokens $total_input)"
+    _box_row "${DIM}Output tokens:${NC}  $(format_tokens $total_output)"
+    _box_row ""
+    _box_row "${BOLD}Total cost:${NC}     ${GREEN}${BOLD}$(format_cost $total_cost)${NC}"
+    _box_row ""
+    
+    printf "${CYAN}${BOX_BL}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_BR}${NC}\n"
+    
+    # Pricing note
+    echo ""
+    echo -e "${DIM}Pricing: \$$COST_INPUT_PER_1M/1M input, \$$COST_OUTPUT_PER_1M/1M output${NC}"
+    echo -e "${DIM}Set HIVE_COST_INPUT and HIVE_COST_OUTPUT to adjust.${NC}"
+    echo ""
+}
+
+print_history() {
+    local history_file="$HIVE_DIR/cost_history.json"
+    
+    if [ ! -f "$history_file" ]; then
+        echo ""
+        echo -e "${YELLOW}No cost history found.${NC}"
+        echo -e "${DIM}History builds as you complete runs.${NC}"
+        echo ""
+        return
+    fi
+    
+    local data=$(cat "$history_file")
+    local total=$(echo "$data" | jq -r '.total_cost_usd // 0')
+    local run_count=$(echo "$data" | jq -r '.runs | length')
+    
+    echo ""
+    printf "${CYAN}${BOX_TL}${BOX_H} Cost History "
+    printf "${BOX_H}%.0s" {1..39}
+    printf "${BOX_TR}${NC}\n"
+    
+    _box_row ""
+    _box_row "${DIM}Total runs:${NC}   ${BOLD}$run_count${NC}"
+    _box_row "${DIM}Total spent:${NC}  ${GREEN}${BOLD}$(format_cost $total)${NC}"
+    
+    if [ "$run_count" -gt 0 ]; then
+        local avg=$(echo "scale=6; $total / $run_count" | bc)
+        _box_row "${DIM}Average/run:${NC}  $(format_cost $avg)"
+    fi
+    
+    _box_row ""
+    printf "${CYAN}${BOX_VR}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_VL}${NC}\n"
+    
+    _box_row ""
+    _box_row "${BOLD}Recent Runs${NC}"
+    
+    echo "$data" | jq -r '
+        .runs | .[-10:] | reverse | .[] |
+        "\(.run_id)|\(.total_cost_usd)|\(.total_input_tokens)|\(.total_output_tokens)"
+    ' 2>/dev/null | while IFS='|' read run_id cost input output; do
+        local cost_fmt=$(format_cost "$cost")
+        local tokens_fmt="$(format_tokens $input)/$(format_tokens $output)"
+        _box_row "  ${DIM}$run_id${NC}  ${GREEN}$cost_fmt${NC}  ${DIM}$tokens_fmt${NC}"
+    done
+    
+    _box_row ""
+    
+    printf "${CYAN}${BOX_BL}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_BR}${NC}\n"
+    echo ""
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    local run_id=""
+    local show_history=false
+    local json_mode=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run|-r)
+                run_id="$2"
+                shift 2
+                ;;
+            --history|-H)
+                show_history=true
+                shift
+                ;;
+            --json)
+                json_mode=true
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: hive cost [--run <run_id>] [--history] [--json]"
+                echo ""
+                echo "Options:"
+                echo "  -r, --run      Show cost for specific run"
+                echo "  -H, --history  Show cost history across all runs"
+                echo "  --json         Output in JSON format"
+                echo ""
+                echo "Environment:"
+                echo "  HIVE_COST_INPUT   Input token price per 1M (default: $3.00)"
+                echo "  HIVE_COST_OUTPUT  Output token price per 1M (default: $15.00)"
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    
+    if [ "$show_history" = true ]; then
+        if [ "$json_mode" = true ]; then
+            cat "$HIVE_DIR/cost_history.json" 2>/dev/null || echo "{}"
+        else
+            print_history
+        fi
+        exit 0
+    fi
+    
+    # Get current run if not specified
+    if [ -z "$run_id" ]; then
+        run_id=$(get_current_run)
+    fi
+    
+    if [ -z "$run_id" ]; then
+        echo ""
+        echo -e "${YELLOW}No runs found.${NC}"
+        echo -e "${DIM}Run a workflow first: hive run \"your objective\"${NC}"
+        echo ""
+        exit 0
+    fi
+    
+    if [ "$json_mode" = true ]; then
+        cat "$HIVE_DIR/runs/$run_id/cost.json" 2>/dev/null || echo "{}"
+    else
+        print_run_cost "$run_id"
+    fi
+}
+
+main "$@"

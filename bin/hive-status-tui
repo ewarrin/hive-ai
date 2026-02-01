@@ -1,0 +1,1030 @@
+#!/usr/bin/env bash
+# Hive Status TUI - Real-time workflow monitoring
+#
+# Usage: hive status --tui
+
+# Note: No 'set -e' here - TUI needs to handle errors gracefully
+
+HIVE_DIR="${HIVE_DIR:-.hive}"
+
+# ============================================================================
+# Terminal Setup
+# ============================================================================
+
+# Colors
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[1;33m'
+C_BLUE='\033[0;34m'
+C_CYAN='\033[0;36m'
+C_MAGENTA='\033[0;35m'
+C_BOLD='\033[1m'
+C_DIM='\033[2m'
+C_NC='\033[0m'
+
+# Box drawing (rounded)
+B_TL='╭'
+B_TR='╮'
+B_BL='╰'
+B_BR='╯'
+B_H='─'
+B_V='│'
+B_VR='├'
+B_VL='┤'
+
+# Terminal dimensions
+TERM_ROWS=$(tput lines)
+TERM_COLS=$(tput cols)
+
+# State
+CURRENT_VIEW="overview"
+RUNNING=true
+SCROLL_OFFSET=0
+NEED_FULL_CLEAR=true  # Clear on first render
+
+# ============================================================================
+# Terminal Control
+# ============================================================================
+
+tui_init() {
+    # Save terminal settings
+    SAVED_STTY=$(stty -g 2>/dev/null || true)
+    
+    # Enable alternate screen buffer and hide cursor
+    tput smcup 2>/dev/null || true
+    tput civis 2>/dev/null || true
+    
+    # Trap exit to restore terminal
+    trap tui_cleanup EXIT INT TERM HUP
+}
+
+tui_cleanup() {
+    # Restore terminal settings
+    if [ -n "${SAVED_STTY:-}" ]; then
+        stty "$SAVED_STTY" 2>/dev/null || true
+    fi
+    
+    # Show cursor and restore screen
+    tput cnorm 2>/dev/null || true
+    tput rmcup 2>/dev/null || true
+}
+
+tui_clear() {
+    # Move to home position instead of clearing (prevents flash on refresh)
+    tput home 2>/dev/null || tput cup 0 0
+}
+
+tui_full_clear() {
+    # Actually clear screen (use when switching views)
+    tput clear 2>/dev/null || true
+}
+
+tui_goto() {
+    tput cup "$1" "$2"
+}
+
+tui_print() {
+    local row=$1
+    local col=$2
+    local text=$3
+    tput cup "$row" "$col"
+    echo -ne "$text"
+}
+
+# ============================================================================
+# Data Fetching
+# ============================================================================
+
+get_run_data() {
+    local scratchpad="$HIVE_DIR/scratchpad.json"
+    if [ -f "$scratchpad" ]; then
+        cat "$scratchpad"
+    else
+        echo "{}"
+    fi
+}
+
+get_current_run_id() {
+    if [ -d "$HIVE_DIR/runs" ]; then
+        local latest=$(ls -td "$HIVE_DIR/runs"/*/ 2>/dev/null | grep -v _subagents | head -1)
+        if [ -n "$latest" ]; then
+            basename "$latest"
+        fi
+    fi
+}
+
+get_cost_data() {
+    local run_id=$(get_current_run_id)
+    local cost_file="$HIVE_DIR/runs/$run_id/cost.json"
+    if [ -f "$cost_file" ]; then
+        cat "$cost_file"
+    else
+        echo '{"total_cost_usd": 0}'
+    fi
+}
+
+get_git_data() {
+    local run_id=$(get_current_run_id)
+    local git_file="$HIVE_DIR/runs/$run_id/git_state.json"
+    if [ -f "$git_file" ]; then
+        cat "$git_file"
+    else
+        echo '{}'
+    fi
+}
+
+get_tasks() {
+    if command -v bd &>/dev/null; then
+        bd list --json 2>/dev/null || echo "[]"
+    else
+        echo "[]"
+    fi
+}
+
+get_agent_outputs() {
+    local run_id=$(get_current_run_id)
+    local output_dir="$HIVE_DIR/runs/$run_id/output"
+    
+    if [ -d "$output_dir" ]; then
+        for f in "$output_dir"/*.txt; do
+            [ -f "$f" ] || continue
+            local agent=$(basename "$f" .txt)
+            local lines=$(wc -l < "$f" | tr -d ' ')
+            local mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo "0")
+            echo "$agent|$lines|$mtime"
+        done | sort -t'|' -k3 -rn
+    fi
+}
+
+get_latest_output() {
+    local run_id=$(get_current_run_id)
+    local output_dir="$HIVE_DIR/runs/$run_id/output"
+    local lines="${1:-20}"
+    
+    if [ -d "$output_dir" ]; then
+        # Look for both .md and .txt files
+        local latest=$(ls -t "$output_dir"/*.md "$output_dir"/*.txt 2>/dev/null | head -1)
+        if [ -f "$latest" ]; then
+            tail -n "$lines" "$latest" 2>/dev/null
+        fi
+    fi
+}
+
+get_file_changes() {
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null; then
+        git diff --stat HEAD~1 2>/dev/null | head -10
+    fi
+}
+
+# ============================================================================
+# Rendering Helpers
+# ============================================================================
+
+_hr() {
+    local width=$((TERM_COLS - 2))
+    printf "${C_CYAN}${B_VR}"
+    printf "${B_H}%.0s" $(seq 1 $width)
+    printf "${B_VL}${C_NC}"
+}
+
+_hr_title() {
+    local title="$1"
+    local title_len=${#title}
+    local width=$((TERM_COLS - 2))
+    local after=$((width - title_len - 2))
+    
+    printf "${C_CYAN}${B_VR}${B_H} ${C_NC}${C_BOLD}%s${C_NC}${C_CYAN} " "$title"
+    printf "${B_H}%.0s" $(seq 1 $after)
+    printf "${B_VL}${C_NC}"
+}
+
+_row() {
+    local content="$1"
+    local width=$((TERM_COLS - 4))
+    
+    # Strip ANSI for length calculation
+    local plain=$(echo -e "$content" | sed 's/\x1b\[[0-9;]*m//g')
+    local len=${#plain}
+    local padding=$((width - len))
+    [ $padding -lt 0 ] && padding=0
+    
+    printf "${C_CYAN}${B_V}${C_NC} %b%*s ${C_CYAN}${B_V}${C_NC}" "$content" "$padding" ""
+}
+
+_empty_row() {
+    local width=$((TERM_COLS - 4))
+    printf "${C_CYAN}${B_V}${C_NC} %*s ${C_CYAN}${B_V}${C_NC}" "$width" ""
+}
+
+_top_border() {
+    local title="$1"
+    local width=$((TERM_COLS - 2))
+    
+    if [ -n "$title" ]; then
+        local title_len=${#title}
+        local after=$((width - title_len - 4))
+        printf "${C_CYAN}${B_TL}${B_H} %s ${B_H}" "$title"
+        printf "${B_H}%.0s" $(seq 1 $after)
+        printf "${B_TR}${C_NC}"
+    else
+        printf "${C_CYAN}${B_TL}"
+        printf "${B_H}%.0s" $(seq 1 $width)
+        printf "${B_TR}${C_NC}"
+    fi
+}
+
+_bottom_border() {
+    local width=$((TERM_COLS - 2))
+    printf "${C_CYAN}${B_BL}"
+    printf "${B_H}%.0s" $(seq 1 $width)
+    printf "${B_BR}${C_NC}"
+}
+
+_format_duration() {
+    local seconds=$1
+    if [ -z "$seconds" ] || [ "$seconds" = "null" ]; then
+        echo "—"
+    elif [ "$seconds" -lt 60 ]; then
+        echo "${seconds}s"
+    elif [ "$seconds" -lt 3600 ]; then
+        printf "%dm %ds" $((seconds / 60)) $((seconds % 60))
+    else
+        printf "%dh %dm" $((seconds / 3600)) $(((seconds % 3600) / 60))
+    fi
+}
+
+_format_cost() {
+    local cost=$1
+    if [ -z "$cost" ] || [ "$cost" = "null" ]; then
+        echo "\$0.00"
+    else
+        printf "\$%.2f" "$cost"
+    fi
+}
+
+_truncate() {
+    local str="$1"
+    local max="$2"
+    if [ ${#str} -gt $max ]; then
+        echo "${str:0:$((max-1))}…"
+    else
+        echo "$str"
+    fi
+}
+
+# ============================================================================
+# Views
+# ============================================================================
+
+render_header() {
+    local data=$(get_run_data)
+    local cost_data=$(get_cost_data)
+    local git_data=$(get_git_data)
+    
+    local run_id=$(echo "$data" | jq -r '.run_id // "—"')
+    local status=$(echo "$data" | jq -r '.status // "unknown"')
+    local objective=$(echo "$data" | jq -r '.objective // "—"')
+    local start_time=$(echo "$data" | jq -r '.start_time // 0')
+    local total_cost=$(echo "$cost_data" | jq -r '.total_cost_usd // 0')
+    local branch=$(echo "$git_data" | jq -r '.work_branch // ""')
+    local commit_count=$(echo "$git_data" | jq -r '.commits | length // 0' 2>/dev/null || echo "0")
+    
+    # Calculate elapsed
+    local elapsed="—"
+    if [ "$start_time" != "0" ] && [ "$start_time" != "null" ]; then
+        local now=$(date +%s)
+        elapsed=$(_format_duration $((now - start_time)))
+    fi
+    
+    # Status icon
+    local status_icon="${C_DIM}○${C_NC}"
+    local status_text="$status"
+    case "$status" in
+        running|in_progress) status_icon="${C_GREEN}●${C_NC}"; status_text="running" ;;
+        complete) status_icon="${C_GREEN}✓${C_NC}"; status_text="complete" ;;
+        failed) status_icon="${C_RED}✗${C_NC}"; status_text="failed" ;;
+        blocked) status_icon="${C_YELLOW}◌${C_NC}"; status_text="blocked" ;;
+    esac
+    
+    tui_goto 0 0
+    _top_border "Hive Status"
+    echo ""
+    
+    tui_goto 1 0
+    _empty_row
+    echo ""
+    
+    tui_goto 2 0
+    _row "${C_DIM}Run:${C_NC} ${C_BOLD}$run_id${C_NC}   $status_icon $status_text   ${C_DIM}Elapsed:${C_NC} ${C_BOLD}$elapsed${C_NC}   ${C_DIM}Cost:${C_NC} ${C_GREEN}$(_format_cost $total_cost)${C_NC}"
+    echo ""
+    
+    tui_goto 3 0
+    if [ -n "$branch" ] && [ "$branch" != "null" ]; then
+        _row "${C_DIM}Branch:${C_NC} ${C_CYAN}$branch${C_NC}  ${C_DIM}($commit_count commits)${C_NC}"
+    else
+        _row "${C_DIM}Objective:${C_NC} $(_truncate "$objective" 55)"
+    fi
+    echo ""
+    
+    tui_goto 4 0
+    _empty_row
+    echo ""
+}
+
+render_git_view() {
+    tui_clear
+    render_header
+    
+    local row=5
+    local git_data=$(get_git_data)
+    
+    tui_goto $row 0
+    _hr_title "Git Status"
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    echo ""
+    row=$((row + 1))
+    
+    local work_branch=$(echo "$git_data" | jq -r '.work_branch // ""')
+    local original_branch=$(echo "$git_data" | jq -r '.original_branch // ""')
+    local pr_url=$(echo "$git_data" | jq -r '.pr_url // ""')
+    
+    if [ -z "$work_branch" ] || [ "$work_branch" = "null" ]; then
+        tui_goto $row 0
+        _row "  ${C_DIM}Git integration not active for this run${C_NC}"
+        echo ""
+        row=$((row + 1))
+    else
+        tui_goto $row 0
+        _row "  ${C_DIM}Work branch:${C_NC}     ${C_CYAN}$work_branch${C_NC}"
+        echo ""
+        row=$((row + 1))
+        
+        tui_goto $row 0
+        _row "  ${C_DIM}Original branch:${C_NC} $original_branch"
+        echo ""
+        row=$((row + 1))
+        
+        if [ -n "$pr_url" ] && [ "$pr_url" != "null" ]; then
+            tui_goto $row 0
+            _row "  ${C_DIM}Pull Request:${C_NC}    ${C_GREEN}$pr_url${C_NC}"
+            echo ""
+            row=$((row + 1))
+        fi
+        
+        tui_goto $row 0
+        _empty_row
+        echo ""
+        row=$((row + 1))
+        
+        # Show commits
+        tui_goto $row 0
+        _hr_title "Commits"
+        echo ""
+        row=$((row + 1))
+        
+        tui_goto $row 0
+        _empty_row
+        echo ""
+        row=$((row + 1))
+        
+        local commits=$(echo "$git_data" | jq -r '.commits[]? | "\(.hash)|\(.agent)|\(.message)"' 2>/dev/null)
+        
+        if [ -z "$commits" ]; then
+            tui_goto $row 0
+            _row "  ${C_DIM}No commits yet${C_NC}"
+            echo ""
+            row=$((row + 1))
+        else
+            echo "$commits" | while IFS='|' read -r hash agent message; do
+                tui_goto $row 0
+                _row "  ${C_DIM}$hash${C_NC}  ${C_CYAN}[$agent]${C_NC}  $(_truncate "$message" 40)"
+                echo ""
+                row=$((row + 1))
+                [ $row -ge $((TERM_ROWS - 5)) ] && break
+            done
+        fi
+        
+        tui_goto $row 0
+        _empty_row
+        echo ""
+        row=$((row + 1))
+        
+        # Show file changes if git available
+        if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+            tui_goto $row 0
+            _hr_title "Changed Files"
+            echo ""
+            row=$((row + 1))
+            
+            tui_goto $row 0
+            _empty_row
+            echo ""
+            row=$((row + 1))
+            
+            local diff_stat=$(git diff --stat "$original_branch..HEAD" 2>/dev/null | head -8)
+            
+            if [ -n "$diff_stat" ]; then
+                echo "$diff_stat" | while IFS= read -r line; do
+                    tui_goto $row 0
+                    _row "  ${C_DIM}$(_truncate "$line" 55)${C_NC}"
+                    echo ""
+                    row=$((row + 1))
+                    [ $row -ge $((TERM_ROWS - 3)) ] && break
+                done
+            else
+                tui_goto $row 0
+                _row "  ${C_DIM}No changes from $original_branch${C_NC}"
+                echo ""
+            fi
+        fi
+    fi
+    
+    tui_goto $((TERM_ROWS - 3)) 0
+    _empty_row
+    echo ""
+    
+    render_footer $((TERM_ROWS - 2))
+}
+
+render_footer() {
+    local row=$1
+    
+    tui_goto $row 0
+    _bottom_border
+    echo ""
+    
+    tui_goto $((row + 1)) 0
+    echo -e "  ${C_DIM}q${C_NC}: quit  ${C_DIM}r${C_NC}: refresh  ${C_DIM}1${C_NC}: overview  ${C_DIM}2${C_NC}: files  ${C_DIM}3${C_NC}: timeline  ${C_DIM}4${C_NC}: tasks  ${C_DIM}5${C_NC}: cost  ${C_DIM}6${C_NC}: git"
+}
+
+render_overview() {
+    tui_clear
+    render_header
+    
+    # Render pipeline starting at row 5
+    _render_pipeline_at 5
+    
+    # Render tasks after pipeline (row 14 - gives 7 rows for pipeline)
+    _render_tasks_at 14
+    
+    # Footer at bottom
+    render_footer $((TERM_ROWS - 2))
+}
+
+_render_pipeline_at() {
+    local row=$1
+    local run_id=$(get_current_run_id)
+    local data=$(get_run_data)
+    local current_agent=$(echo "$data" | jq -r '.current_agent // ""' 2>/dev/null)
+    
+    tui_goto $row 0
+    _hr_title "Pipeline"
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    row=$((row + 1))
+    
+    for agent in architect implementer ui-designer tester reviewer documenter; do
+        local output_file="$HIVE_DIR/runs/$run_id/output/${agent}.txt"
+        
+        local icon="${C_DIM}○${C_NC}"
+        local summary=""
+        
+        if [ -f "$output_file" ]; then
+            if [ "$agent" = "$current_agent" ]; then
+                icon="${C_YELLOW}●${C_NC}"
+                summary="Running..."
+            else
+                icon="${C_GREEN}✓${C_NC}"
+            fi
+        fi
+        
+        tui_goto $row 0
+        _row "  $icon $(printf '%-12s' "$agent")  ${C_DIM}$summary${C_NC}"
+        row=$((row + 1))
+    done
+    
+    tui_goto $row 0
+    _empty_row
+}
+
+_render_tasks_at() {
+    local row=$1
+    local data=$(get_run_data)
+    local epic_id=$(echo "$data" | jq -r '.epic_id // ""' 2>/dev/null)
+    local objective=$(echo "$data" | jq -r '.objective // ""' 2>/dev/null)
+    
+    # Get tasks for this epic
+    local all_tasks=$(get_tasks)
+    local epic_tasks="[]"
+    
+    if [ -n "$epic_id" ] && [ "$epic_id" != "null" ]; then
+        epic_tasks=$(echo "$all_tasks" | jq --arg epic "$epic_id" '[.[] | select(.id | startswith($epic) or .parent == $epic)]' 2>/dev/null || echo "[]")
+    fi
+    
+    local task_count=$(echo "$epic_tasks" | jq 'length' 2>/dev/null || echo "0")
+    local closed_count=$(echo "$epic_tasks" | jq '[.[] | select(.status == "closed")] | length' 2>/dev/null || echo "0")
+    local in_progress_count=$(echo "$epic_tasks" | jq '[.[] | select(.status == "in_progress")] | length' 2>/dev/null || echo "0")
+    
+    # Epic header
+    tui_goto $row 0
+    if [ -n "$epic_id" ] && [ "$epic_id" != "null" ]; then
+        _hr_title "Epic: $epic_id"
+    else
+        _hr_title "Tasks"
+    fi
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    row=$((row + 1))
+    
+    # Objective (truncated)
+    if [ -n "$objective" ] && [ "$objective" != "null" ]; then
+        tui_goto $row 0
+        _row "  ${C_DIM}$(_truncate "$objective" 50)${C_NC}"
+        row=$((row + 1))
+        
+        tui_goto $row 0
+        _empty_row
+        row=$((row + 1))
+    fi
+    
+    # Progress bar
+    if [ "$task_count" -gt 0 ] 2>/dev/null; then
+        local pct=0
+        [ "$task_count" -gt 0 ] && pct=$((closed_count * 100 / task_count))
+        local bar_width=20
+        local filled=$((pct * bar_width / 100))
+        local empty=$((bar_width - filled))
+        
+        local bar="${C_GREEN}"
+        for i in $(seq 1 $filled 2>/dev/null || echo ""); do bar="${bar}█"; done
+        bar="${bar}${C_DIM}"
+        for i in $(seq 1 $empty 2>/dev/null || echo ""); do bar="${bar}░"; done
+        bar="${bar}${C_NC}"
+        
+        tui_goto $row 0
+        _row "  Progress: $bar ${C_BOLD}$closed_count${C_NC}/${task_count} (${pct}%)"
+        row=$((row + 1))
+        
+        tui_goto $row 0
+        _empty_row
+        row=$((row + 1))
+    fi
+    
+    # Tasks list
+    tui_goto $row 0
+    _row "  ${C_DIM}Tasks:${C_NC}"
+    row=$((row + 1))
+    
+    if [ "$task_count" -eq 0 ] || [ "$task_count" = "null" ]; then
+        tui_goto $row 0
+        _row "    ${C_DIM}No tasks yet${C_NC}"
+        row=$((row + 1))
+    else
+        local shown=0
+        while IFS='|' read -r id title status; do
+            [ -z "$id" ] && continue
+            [ $shown -ge 5 ] && break
+            
+            local icon="${C_DIM}○${C_NC}"
+            case "$status" in
+                closed) icon="${C_GREEN}✓${C_NC}" ;;
+                in_progress) icon="${C_YELLOW}●${C_NC}" ;;
+                blocked) icon="${C_RED}◌${C_NC}" ;;
+            esac
+            
+            # Shorten ID (just show suffix)
+            local short_id="${id##*-}"
+            
+            tui_goto $row 0
+            _row "    $icon $(_truncate "$title" 45)"
+            row=$((row + 1))
+            shown=$((shown + 1))
+        done < <(echo "$epic_tasks" | jq -r '.[] | "\(.id)|\(.title)|\(.status)"' 2>/dev/null)
+        
+        local remaining=$((task_count - shown))
+        if [ "$remaining" -gt 0 ]; then
+            tui_goto $row 0
+            _row "    ${C_DIM}... and $remaining more${C_NC}"
+            row=$((row + 1))
+        fi
+    fi
+    
+    tui_goto $row 0
+    _empty_row
+}
+
+_render_output_at() {
+    local row=$1
+    
+    tui_goto $row 0
+    _hr_title "Live Output"
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    row=$((row + 1))
+    
+    local output=$(get_latest_output 4)
+    
+    if [ -z "$output" ]; then
+        tui_goto $row 0
+        _row "  ${C_DIM}Waiting for output...${C_NC}"
+    else
+        local line_num=0
+        while IFS= read -r line && [ $line_num -lt 4 ]; do
+            tui_goto $row 0
+            _row "  ${C_DIM}$(echo "$line" | head -c 50)${C_NC}"
+            row=$((row + 1))
+            line_num=$((line_num + 1))
+        done <<< "$output"
+    fi
+    
+    tui_goto $row 0
+    _empty_row
+}
+
+render_files_view() {
+    tui_clear
+    render_header
+    
+    local row=5
+    local run_id=$(get_current_run_id)
+    
+    tui_goto $row 0
+    _hr_title "Files Changed"
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    echo ""
+    row=$((row + 1))
+    
+    # Get files changed from git
+    local files_changed=""
+    if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+        # Get diff from initial snapshot or original branch
+        local original_branch=$(cat "$HIVE_DIR/runs/$run_id/git_state.json" 2>/dev/null | jq -r '.original_branch // ""')
+        if [ -n "$original_branch" ] && [ "$original_branch" != "null" ]; then
+            files_changed=$(git diff --stat "$original_branch" 2>/dev/null | head -$((TERM_ROWS - row - 5)))
+        else
+            files_changed=$(git diff --stat HEAD 2>/dev/null | head -$((TERM_ROWS - row - 5)))
+        fi
+    fi
+    
+    if [ -z "$files_changed" ]; then
+        # Try to get from agent outputs
+        local output_dir="$HIVE_DIR/runs/$run_id/output"
+        if [ -d "$output_dir" ]; then
+            files_changed=$(grep -h -E "^(Writing|Created|Modified|Wrote|Deleted)" "$output_dir"/*.md 2>/dev/null | sort -u | head -$((TERM_ROWS - row - 5)))
+        fi
+    fi
+    
+    if [ -z "$files_changed" ]; then
+        tui_goto $row 0
+        _row "  ${C_DIM}No file changes detected yet${C_NC}"
+        echo ""
+        row=$((row + 1))
+    else
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            tui_goto $row 0
+            
+            # Color code additions/deletions
+            local display_line="$line"
+            if echo "$line" | grep -q "+.*-"; then
+                # Git stat line with insertions/deletions
+                display_line=$(echo "$line" | sed "s/+/${C_GREEN}+/g" | sed "s/-/${C_RED}-/g")
+                display_line="${display_line}${C_NC}"
+            elif echo "$line" | grep -qE "^(Writing|Created|Wrote)"; then
+                display_line="${C_GREEN}$line${C_NC}"
+            elif echo "$line" | grep -qE "^(Modified)"; then
+                display_line="${C_YELLOW}$line${C_NC}"
+            elif echo "$line" | grep -qE "^(Deleted)"; then
+                display_line="${C_RED}$line${C_NC}"
+            fi
+            
+            _row "  $(_truncate "$display_line" $((TERM_COLS - 6)))"
+            echo ""
+            row=$((row + 1))
+            [ $row -ge $((TERM_ROWS - 3)) ] && break
+        done <<< "$files_changed"
+    fi
+    
+    tui_goto $((TERM_ROWS - 3)) 0
+    _empty_row
+    echo ""
+    
+    render_footer $((TERM_ROWS - 2))
+}
+
+render_timeline_view() {
+    tui_clear
+    render_header
+    
+    local row=5
+    local run_id=$(get_current_run_id)
+    local data=$(get_run_data)
+    
+    tui_goto $row 0
+    _hr_title "Timeline"
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    echo ""
+    row=$((row + 1))
+    
+    # Get start time
+    local start_time=$(echo "$data" | jq -r '.start_time // 0' 2>/dev/null)
+    local current_agent=$(echo "$data" | jq -r '.current_agent // ""' 2>/dev/null)
+    
+    if [ "$start_time" != "0" ] && [ "$start_time" != "null" ]; then
+        local start_fmt=$(date -r "$start_time" "+%H:%M:%S" 2>/dev/null || date -d "@$start_time" "+%H:%M:%S" 2>/dev/null || echo "??:??:??")
+        tui_goto $row 0
+        _row "  ${C_DIM}Started:${C_NC} $start_fmt"
+        echo ""
+        row=$((row + 1))
+        
+        tui_goto $row 0
+        _empty_row
+        echo ""
+        row=$((row + 1))
+    fi
+    
+    # Show each agent's timing from output files
+    local output_dir="$HIVE_DIR/runs/$run_id/output"
+    
+    for agent in architect implementer ui-designer tester reviewer documenter; do
+        local output_file="$output_dir/${agent}_attempt_1.md"
+        [ ! -f "$output_file" ] && continue
+        
+        # Get file timestamps
+        local mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo "0")
+        local size=$(wc -c < "$output_file" 2>/dev/null | tr -d ' ')
+        local time_fmt=$(date -r "$mtime" "+%H:%M:%S" 2>/dev/null || date -d "@$mtime" "+%H:%M:%S" 2>/dev/null || echo "??:??:??")
+        
+        local icon="${C_GREEN}✓${C_NC}"
+        local status_text="done"
+        
+        if [ "$agent" = "$current_agent" ]; then
+            icon="${C_YELLOW}●${C_NC}"
+            status_text="running"
+        fi
+        
+        # Estimate tokens (rough: 4 chars per token)
+        local tokens=$((size / 4))
+        local tokens_fmt=""
+        if [ "$tokens" -ge 1000 ]; then
+            tokens_fmt="~$((tokens / 1000))k tokens"
+        else
+            tokens_fmt="~${tokens} tokens"
+        fi
+        
+        tui_goto $row 0
+        _row "  $icon $(printf '%-14s' "$agent") ${C_DIM}$time_fmt  $tokens_fmt${C_NC}"
+        echo ""
+        row=$((row + 1))
+        
+        [ $row -ge $((TERM_ROWS - 5)) ] && break
+    done
+    
+    # Show elapsed time
+    if [ "$start_time" != "0" ] && [ "$start_time" != "null" ]; then
+        local now=$(date +%s)
+        local elapsed=$((now - start_time))
+        local mins=$((elapsed / 60))
+        local secs=$((elapsed % 60))
+        
+        tui_goto $row 0
+        _empty_row
+        echo ""
+        row=$((row + 1))
+        
+        tui_goto $row 0
+        _row "  ${C_DIM}Elapsed:${C_NC} ${mins}m ${secs}s"
+        echo ""
+        row=$((row + 1))
+    fi
+    
+    tui_goto $((TERM_ROWS - 3)) 0
+    _empty_row
+    echo ""
+    
+    render_footer $((TERM_ROWS - 2))
+}
+
+render_tasks_view() {
+    tui_clear
+    render_header
+    
+    local row=5
+    tui_goto $row 0
+    _hr_title "All Tasks"
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    echo ""
+    row=$((row + 1))
+    
+    local tasks=$(get_tasks)
+    local max_tasks=$((TERM_ROWS - row - 4))
+    
+    echo "$tasks" | jq -r '.[] | "\(.id)|\(.title)|\(.status)|\(.priority // 2)"' 2>/dev/null | head -n $max_tasks | while IFS='|' read -r id title status priority; do
+        local icon="${C_DIM}○${C_NC}"
+        case "$status" in
+            closed) icon="${C_GREEN}✓${C_NC}" ;;
+            in_progress) icon="${C_CYAN}◐${C_NC}" ;;
+            blocked) icon="${C_RED}◌${C_NC}" ;;
+            open|ready) icon="${C_YELLOW}○${C_NC}" ;;
+        esac
+        
+        local prio_display=""
+        case "$priority" in
+            0) prio_display="${C_RED}P0${C_NC}" ;;
+            1) prio_display="${C_YELLOW}P1${C_NC}" ;;
+            2) prio_display="${C_DIM}P2${C_NC}" ;;
+            *) prio_display="${C_DIM}P$priority${C_NC}" ;;
+        esac
+        
+        tui_goto $row 0
+        _row "  $icon ${C_DIM}$id${C_NC}  $prio_display  $(_truncate "$title" 45)  ${C_DIM}$status${C_NC}"
+        echo ""
+        row=$((row + 1))
+        [ $row -ge $((TERM_ROWS - 3)) ] && break
+    done
+    
+    tui_goto $((TERM_ROWS - 3)) 0
+    _empty_row
+    echo ""
+    
+    render_footer $((TERM_ROWS - 2))
+}
+
+render_cost_view() {
+    tui_clear
+    render_header
+    
+    local row=5
+    local cost_data=$(get_cost_data)
+    
+    tui_goto $row 0
+    _hr_title "Cost Breakdown"
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _empty_row
+    echo ""
+    row=$((row + 1))
+    
+    # Agents
+    echo "$cost_data" | jq -r '.agents | to_entries[] | "\(.key)|\(.value.cost_usd)|\(.value.input_tokens)|\(.value.output_tokens)|\(.value.calls)"' 2>/dev/null | while IFS='|' read -r agent cost input output calls; do
+        tui_goto $row 0
+        local cost_fmt=$(printf "\$%.4f" "$cost")
+        local input_fmt=$(printf "%.1fK" $(echo "scale=1; $input / 1000" | bc 2>/dev/null || echo "0"))
+        local output_fmt=$(printf "%.1fK" $(echo "scale=1; $output / 1000" | bc 2>/dev/null || echo "0"))
+        _row "  ${C_BOLD}$(printf "%-14s" "$agent")${C_NC} ${C_GREEN}$cost_fmt${C_NC}  ${C_DIM}$input_fmt in / $output_fmt out${C_NC}  ${C_DIM}x$calls${C_NC}"
+        echo ""
+        row=$((row + 1))
+    done
+    
+    tui_goto $row 0
+    _empty_row
+    echo ""
+    row=$((row + 1))
+    
+    # Totals
+    local total_cost=$(echo "$cost_data" | jq -r '.total_cost_usd // 0')
+    local total_input=$(echo "$cost_data" | jq -r '.total_input_tokens // 0')
+    local total_output=$(echo "$cost_data" | jq -r '.total_output_tokens // 0')
+    
+    tui_goto $row 0
+    _hr
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _row "  ${C_DIM}Total:${C_NC}         ${C_GREEN}${C_BOLD}$(_format_cost $total_cost)${C_NC}"
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $row 0
+    _row "  ${C_DIM}Tokens:${C_NC}        ${total_input} in / ${total_output} out"
+    echo ""
+    row=$((row + 1))
+    
+    tui_goto $((TERM_ROWS - 3)) 0
+    _empty_row
+    echo ""
+    
+    render_footer $((TERM_ROWS - 2))
+}
+
+# ============================================================================
+# Main Loop
+# ============================================================================
+
+handle_input() {
+    local key
+    # Read with 1 second timeout - this replaces the sleep
+    read -rsn1 -t 1 key 2>/dev/null || return 0
+    
+    case "$key" in
+        q|Q)
+            RUNNING=false
+            ;;
+        r|R)
+            NEED_FULL_CLEAR=true
+            ;;
+        1)
+            CURRENT_VIEW="overview"
+            NEED_FULL_CLEAR=true
+            ;;
+        2)
+            CURRENT_VIEW="files"
+            NEED_FULL_CLEAR=true
+            ;;
+        3)
+            CURRENT_VIEW="timeline"
+            NEED_FULL_CLEAR=true
+            ;;
+        4)
+            CURRENT_VIEW="tasks"
+            NEED_FULL_CLEAR=true
+            ;;
+        5)
+            CURRENT_VIEW="cost"
+            NEED_FULL_CLEAR=true
+            ;;
+        6)
+            CURRENT_VIEW="git"
+            NEED_FULL_CLEAR=true
+            ;;
+    esac
+}
+
+render() {
+    # Full clear when switching views
+    if [ "$NEED_FULL_CLEAR" = "true" ]; then
+        tui_full_clear
+        NEED_FULL_CLEAR=false
+    fi
+    
+    case "$CURRENT_VIEW" in
+        overview)
+            render_overview
+            ;;
+        files)
+            render_files_view
+            ;;
+        timeline)
+            render_timeline_view
+            ;;
+        tasks)
+            render_tasks_view
+            ;;
+        cost)
+            render_cost_view
+            ;;
+        git)
+            render_git_view
+            ;;
+    esac
+}
+
+main() {
+    # Check if we have a run
+    local run_id=$(get_current_run_id)
+    if [ -z "$run_id" ]; then
+        echo "No active or recent runs found."
+        echo "Start a workflow with: hive run \"your objective\""
+        exit 0
+    fi
+    
+    tui_init
+    
+    while $RUNNING; do
+        # Update terminal size
+        TERM_ROWS=$(tput lines)
+        TERM_COLS=$(tput cols)
+        
+        render
+        handle_input  # Has 1 second timeout built in
+    done
+    
+    tui_cleanup
+}
+
+main "$@"

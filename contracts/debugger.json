@@ -1,0 +1,67 @@
+{
+  "agent": "debugger",
+  "version": "1.0",
+  "description": "Diagnoses and fixes bugs, build failures, and test failures",
+  
+  "inputs": {
+    "required": {
+      "error": "The error or failure to diagnose",
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "handoff_document": "Path to handoff JSON with context",
+      "stack_trace": "Full stack trace if available",
+      "reproduction_steps": "Steps to reproduce the issue"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "diagnosis": {
+        "type": "string",
+        "description": "Root cause analysis"
+      },
+      "fix_applied": {
+        "type": "boolean",
+        "description": "Whether a fix was implemented"
+      },
+      "files_modified": {
+        "type": "list",
+        "description": "Files changed to fix the issue"
+      }
+    },
+    "optional": {
+      "verification": {
+        "type": "string",
+        "description": "How the fix was verified"
+      },
+      "prevention": {
+        "type": "string",
+        "description": "Suggestions to prevent similar issues"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads"
+    ],
+    "post": [
+      "Beads task status updated",
+      "Build command exits zero OR blocker is filed"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 3,
+      "backoff": "linear",
+      "feedback": "Previous debug attempt failed: {error}. Try a different approach:\n1. Check the full error message\n2. Look at related code\n3. Verify your fix compiles\n4. Update Beads with findings"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Debugger failed after {attempts} attempts. Manual intervention needed. Error: {error}"
+    }
+  }
+}

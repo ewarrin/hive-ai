@@ -1,0 +1,71 @@
+{
+  "agent": "implementer",
+  "version": "1.0",
+  "description": "Implements code based on designs, updates Beads tasks",
+  
+  "inputs": {
+    "required": {
+      "handoff_document": "Path to handoff JSON from architect",
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "specific_task_id": "If working on a specific task only",
+      "retry_feedback": "Feedback from previous failed attempt"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "files_modified": {
+        "type": "list",
+        "description": "Files created or modified"
+      },
+      "tasks_closed": {
+        "type": "list",
+        "description": "Beads task IDs that were closed"
+      },
+      "build_status": {
+        "type": "enum",
+        "values": ["pass", "fail", "skipped"],
+        "description": "Whether the build passes"
+      }
+    },
+    "optional": {
+      "new_tasks_filed": {
+        "type": "list",
+        "description": "New tasks discovered during implementation"
+      },
+      "blockers_encountered": {
+        "type": "list",
+        "description": "Issues that blocked progress"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Handoff document exists and is valid JSON",
+      "Epic exists in Beads",
+      "At least one task is in 'ready' state"
+    ],
+    "post": [
+      "All claimed tasks are either 'closed' or have blocker filed",
+      "Build command exits zero OR blocker is filed",
+      "Scratchpad updated with decisions/context",
+      "Files modified list is accurate"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 3,
+      "backoff": "linear",
+      "feedback": "Previous implementation attempt failed: {error}. Ensure you:\n1. Run bd update <id> --status in_progress BEFORE coding\n2. Run bd close <id> --reason '...' AFTER completing\n3. The build must pass or file a blocker"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Implementer failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "agent": "migrator",
+  "version": "1.0",
+  "description": "Plans and implements database schema migrations safely",
+
+  "inputs": {
+    "required": {
+      "objective": "Migration objective (e.g., 'Add users table', 'Rename email column')"
+    },
+    "optional": {
+      "db_type": "Database type: postgresql, mysql, sqlite, mongodb (auto-detected if not specified)",
+      "migration_tool": "Migration tool: prisma, drizzle, alembic, typeorm, knex (auto-detected if not specified)",
+      "existing_schema_file": "Path to schema file (e.g., prisma/schema.prisma)",
+      "data_migration_needed": "Whether data transformation is needed (true/false)",
+      "target_environment": "Environment: development, staging, production"
+    }
+  },
+
+  "outputs": {
+    "required": {
+      "migration_files": {
+        "type": "list",
+        "description": "Paths to generated migration files"
+      },
+      "migration_type": {
+        "type": "enum",
+        "values": ["schema_only", "with_data_migration"],
+        "description": "Type of migration"
+      },
+      "rollback_script": {
+        "type": "string",
+        "description": "SQL or code to rollback the migration"
+      }
+    },
+    "optional": {
+      "changes": {
+        "type": "list",
+        "description": "List of schema changes with risk levels"
+      },
+      "breaking_changes": {
+        "type": "list",
+        "description": "List of breaking changes that require attention"
+      },
+      "estimated_duration_seconds": {
+        "type": "number",
+        "description": "Estimated migration execution time"
+      },
+      "data_validation_script": {
+        "type": "string",
+        "description": "Script to verify migration success"
+      }
+    }
+  },
+
+  "validation": {
+    "pre": [
+      "Can detect database type (from config files, environment, or explicit input)",
+      "Can identify migration tool in use",
+      "Can read existing schema or migrations"
+    ],
+    "post": [
+      "Migration files are syntactically valid",
+      "Rollback script is provided",
+      "Breaking changes are documented if present",
+      "Risk assessment is included for each change"
+    ]
+  },
+
+  "on_failure": {
+    "retry": {
+      "max_attempts": 2,
+      "backoff": "linear",
+      "feedback": "Previous migration attempt failed: {error}. Ensure you:\n1. Detected the correct migration tool\n2. Generated valid migration syntax\n3. Provided a working rollback script"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Migrator failed after {attempts} attempts. Error: {error}"
+    }
+  },
+
+  "risk_levels": {
+    "safe": [
+      "Add nullable column",
+      "Add table",
+      "Add index",
+      "Add constraint (if no existing data violates)"
+    ],
+    "careful": [
+      "Add non-nullable column (needs default)",
+      "Rename column",
+      "Change column type (compatible)",
+      "Add foreign key"
+    ],
+    "dangerous": [
+      "Drop column",
+      "Drop table",
+      "Change column type (incompatible)",
+      "Remove constraint with existing violations"
+    ]
+  }
+}

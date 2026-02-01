@@ -1,0 +1,60 @@
+{
+  "agent": "component-tester",
+  "version": "1.0",
+  "description": "Writes component tests with Playwright Component Testing",
+  
+  "inputs": {
+    "required": {
+      "epic_id": "Beads epic ID"
+    },
+    "optional": {
+      "handoff_document": "Path to handoff JSON",
+      "components": "Specific components to test"
+    }
+  },
+  
+  "outputs": {
+    "required": {
+      "tests_written": {
+        "type": "list",
+        "description": "Component test files created"
+      },
+      "test_results": {
+        "type": "object",
+        "description": "Summary of test run"
+      }
+    },
+    "optional": {
+      "accessibility_issues": {
+        "type": "list",
+        "description": "Accessibility issues found"
+      },
+      "bugs_filed": {
+        "type": "list",
+        "description": "Beads bug IDs for failures"
+      }
+    }
+  },
+  
+  "validation": {
+    "pre": [
+      "Epic exists in Beads"
+    ],
+    "post": [
+      "Beads task status updated"
+    ]
+  },
+  
+  "on_failure": {
+    "retry": {
+      "max_attempts": 2,
+      "backoff": "linear",
+      "feedback": "Previous component testing failed: {error}. Ensure:\n1. Playwright CT is configured\n2. Components can be mounted in isolation\n3. Update Beads when done"
+    },
+    "escalate": {
+      "after_retries": true,
+      "action": "checkpoint_human",
+      "message": "Component Tester failed after {attempts} attempts. Error: {error}"
+    }
+  }
+}

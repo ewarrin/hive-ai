@@ -1,0 +1,21 @@
+# Per-project runtime state (created by hive init)
+.hive/runs/
+.hive/handoffs/
+.hive/checkpoints/
+.hive/scratchpad.json
+.hive/memory.json
+.hive/index.md
+
+# Beads state
+.beads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

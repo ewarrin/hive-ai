@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# Hive Doctor - Diagnose setup issues
+#
+# Usage: hive doctor [--fix] [--json] [--check <component>]
+
+set -e
+
+HIVE_ROOT="${HIVE_ROOT:-$HOME/.hive}"
+HIVE_DIR="${HIVE_DIR:-.hive}"
+
+# ============================================================================
+# Colors
+# ============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# Box drawing
+BOX_TL='╭'
+BOX_TR='╮'
+BOX_BL='╰'
+BOX_BR='╯'
+BOX_H='─'
+BOX_V='│'
+BOX_VR='├'
+BOX_VL='┤'
+
+# ============================================================================
+# State
+# ============================================================================
+
+ERRORS=0
+WARNINGS=0
+FIX_MODE=false
+JSON_MODE=false
+CHECK_COMPONENT=""
+
+declare -a ISSUES
+declare -a FIXES
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+_box_line() {
+    local char="$1"
+    printf "${CYAN}${BOX_VR}"
+    printf "${char}%.0s" {1..53}
+    printf "${BOX_VL}${NC}\n"
+}
+
+_box_row() {
+    local content="$1"
+    local plain_content=$(echo -e "$content" | sed 's/\x1b\[[0-9;]*m//g')
+    local len=${#plain_content}
+    local padding=$((51 - len))
+    printf "${CYAN}${BOX_V}${NC}  %b%*s${CYAN}${BOX_V}${NC}\n" "$content" "$padding" ""
+}
+
+_box_row_kv() {
+    local icon="$1"
+    local key="$2"
+    local value="$3"
+    local extra="$4"
+    
+    local content
+    if [ -n "$extra" ]; then
+        content=$(printf "%b %-18s ${DIM}%-10s %s${NC}" "$icon" "$key" "$value" "$extra")
+    else
+        content=$(printf "%b %-18s %s" "$icon" "$key" "$value")
+    fi
+    _box_row "$content"
+}
+
+_check_ok() {
+    echo -e "${GREEN}✓${NC}"
+}
+
+_check_fail() {
+    echo -e "${RED}✗${NC}"
+    ERRORS=$((ERRORS + 1))
+}
+
+_check_warn() {
+    echo -e "${YELLOW}⚠${NC}"
+    WARNINGS=$((WARNINGS + 1))
+}
+
+_check_skip() {
+    echo -e "${DIM}○${NC}"
+}
+
+_version_of() {
+    local cmd="$1"
+    case "$cmd" in
+        claude)
+            claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?"
+            ;;
+        bd)
+            bd --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?"
+            ;;
+        jq)
+            jq --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "?"
+            ;;
+        bash)
+            bash --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?"
+            ;;
+        git)
+            git --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?"
+            ;;
+        tmux)
+            tmux -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "?"
+            ;;
+        node)
+            node --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "?"
+            ;;
+        *)
+            echo "?"
+            ;;
+    esac
+}
+
+_path_of() {
+    which "$1" 2>/dev/null || echo "—"
+}
+
+_mask_key() {
+    local key="$1"
+    if [ ${#key} -gt 10 ]; then
+        echo "${key:0:7}...${key: -3}"
+    else
+        echo "***"
+    fi
+}
+
+add_issue() {
+    local severity="$1"
+    local message="$2"
+    local fix="$3"
+    ISSUES+=("$severity|$message|$fix")
+}
+
+# ============================================================================
+# Checks
+# ============================================================================
+
+check_required() {
+    printf "${CYAN}${BOX_VR}${BOX_H} Required ${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_VL}${NC}\n"
+    
+    # Claude CLI
+    if command -v claude &>/dev/null; then
+        _box_row_kv "$(_check_ok)" "claude CLI" "$(_version_of claude)" "$(_path_of claude)"
+    else
+        _box_row_kv "$(_check_fail)" "claude CLI" "not found" ""
+        add_issue "error" "Claude CLI not installed" "Install from: https://docs.anthropic.com/claude-cli"
+    fi
+    
+    # Beads
+    if command -v bd &>/dev/null; then
+        _box_row_kv "$(_check_ok)" "beads (bd)" "$(_version_of bd)" "$(_path_of bd)"
+    else
+        _box_row_kv "$(_check_fail)" "beads (bd)" "not found" ""
+        add_issue "error" "Beads not installed" "Install from: https://github.com/anthropics/beads"
+    fi
+    
+    # jq
+    if command -v jq &>/dev/null; then
+        _box_row_kv "$(_check_ok)" "jq" "$(_version_of jq)" "$(_path_of jq)"
+    else
+        _box_row_kv "$(_check_fail)" "jq" "not found" ""
+        add_issue "error" "jq not installed" "Install: brew install jq / apt install jq"
+    fi
+    
+    # Bash version
+    local bash_version=$(_version_of bash)
+    local bash_major=$(echo "$bash_version" | cut -d. -f1)
+    if [ "$bash_major" -ge 4 ] 2>/dev/null; then
+        _box_row_kv "$(_check_ok)" "bash" "$bash_version" "(4.0+ required)"
+    else
+        _box_row_kv "$(_check_fail)" "bash" "$bash_version" "(4.0+ required)"
+        add_issue "error" "Bash 4.0+ required, found $bash_version" "Upgrade bash"
+    fi
+    
+    _box_row ""
+}
+
+check_optional() {
+    printf "${CYAN}${BOX_VR}${BOX_H} Optional ${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_VL}${NC}\n"
+    
+    # Git
+    if command -v git &>/dev/null; then
+        _box_row_kv "$(_check_ok)" "git" "$(_version_of git)" "for diff tracking"
+    else
+        _box_row_kv "$(_check_skip)" "git" "—" "for diff tracking"
+        add_issue "info" "git not found" "Optional: enables diff tracking between phases"
+    fi
+    
+    # tmux
+    if command -v tmux &>/dev/null; then
+        _box_row_kv "$(_check_ok)" "tmux" "$(_version_of tmux)" "for background mode"
+    else
+        _box_row_kv "$(_check_skip)" "tmux" "—" "for background mode"
+    fi
+    
+    # Node
+    if command -v node &>/dev/null; then
+        _box_row_kv "$(_check_ok)" "node" "$(_version_of node)" "for JS projects"
+    else
+        _box_row_kv "$(_check_skip)" "node" "—" "for JS projects"
+    fi
+    
+    _box_row ""
+}
+
+check_configuration() {
+    printf "${CYAN}${BOX_VR}${BOX_H} Configuration ${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_VL}${NC}\n"
+    
+    # API Key
+    if [ -n "$ANTHROPIC_API_KEY" ]; then
+        _box_row_kv "$(_check_ok)" "ANTHROPIC_API_KEY" "set" "$(_mask_key "$ANTHROPIC_API_KEY")"
+    else
+        _box_row_kv "$(_check_fail)" "ANTHROPIC_API_KEY" "not set" ""
+        add_issue "error" "ANTHROPIC_API_KEY not set" "Export your API key: export ANTHROPIC_API_KEY=sk-ant-..."
+    fi
+    
+    # Hive installed
+    if [ -d "$HIVE_ROOT" ]; then
+        local agent_count=$(ls "$HIVE_ROOT/agents/"*.md 2>/dev/null | wc -l | tr -d ' ')
+        _box_row_kv "$(_check_ok)" "Hive installed" "$HIVE_ROOT" "${agent_count} agents"
+    else
+        _box_row_kv "$(_check_fail)" "Hive installed" "not found" ""
+        add_issue "error" "Hive not installed at $HIVE_ROOT" "Run: hive setup"
+    fi
+    
+    # Beads initialized (project-level)
+    if [ -d ".beads" ] || [ -f "beads.json" ]; then
+        local task_count=$(bd list --json 2>/dev/null | jq 'length' 2>/dev/null || echo "?")
+        _box_row_kv "$(_check_ok)" "Beads initialized" ".beads/" "${task_count} tasks"
+    else
+        _box_row_kv "$(_check_warn)" "Beads initialized" "no" "run: bd init"
+        add_issue "warning" "Beads not initialized in this project" "Run: bd init"
+    fi
+    
+    _box_row ""
+}
+
+check_project() {
+    printf "${CYAN}${BOX_VR}${BOX_H} Project ${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_VL}${NC}\n"
+    
+    # CLAUDE.md
+    if [ -f "CLAUDE.md" ]; then
+        local lines=$(wc -l < CLAUDE.md | tr -d ' ')
+        _box_row_kv "$(_check_ok)" "CLAUDE.md" "found" "${lines} lines"
+    else
+        _box_row_kv "$(_check_warn)" "CLAUDE.md" "not found" "recommended"
+        add_issue "warning" "No CLAUDE.md found" "Create one with project rules: hive init --claude-md"
+    fi
+    
+    # Project memory
+    if [ -f "$HIVE_DIR/memory.json" ]; then
+        local run_count=$(jq -r '.run_count // 0' "$HIVE_DIR/memory.json" 2>/dev/null || echo "0")
+        _box_row_kv "$(_check_ok)" "Project memory" ".hive/" "${run_count} runs"
+    else
+        _box_row_kv "$(_check_skip)" "Project memory" "none" "created on first run"
+    fi
+    
+    # Detect project type
+    local project_type="unknown"
+    if [ -f "package.json" ]; then
+        if grep -q "nuxt" package.json 2>/dev/null; then
+            project_type="Nuxt"
+        elif grep -q "next" package.json 2>/dev/null; then
+            project_type="Next.js"
+        elif grep -q "vue" package.json 2>/dev/null; then
+            project_type="Vue"
+        elif grep -q "react" package.json 2>/dev/null; then
+            project_type="React"
+        else
+            project_type="Node.js"
+        fi
+    elif [ -f "Cargo.toml" ]; then
+        project_type="Rust"
+    elif [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+        project_type="Python"
+    elif [ -f "go.mod" ]; then
+        project_type="Go"
+    fi
+    
+    _box_row_kv "$(_check_ok)" "Project type" "$project_type" ""
+    
+    _box_row ""
+}
+
+check_connectivity() {
+    printf "${CYAN}${BOX_VR}${BOX_H} Connectivity ${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_H}${BOX_VL}${NC}\n"
+    
+    # API connectivity
+    if command -v curl &>/dev/null && [ -n "$ANTHROPIC_API_KEY" ]; then
+        local start_time=$(date +%s)
+        local response=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            "https://api.anthropic.com/v1/messages" 2>/dev/null || echo "000")
+        local end_time=$(date +%s)
+        local latency=$((end_time - start_time))
+        
+        # 400 is expected (no body), 401 means bad key, 000 means no connection
+        if [ "$response" = "400" ] || [ "$response" = "200" ]; then
+            _box_row_kv "$(_check_ok)" "Anthropic API" "reachable" "(${latency}ms)"
+        elif [ "$response" = "401" ]; then
+            _box_row_kv "$(_check_fail)" "Anthropic API" "auth failed" "check API key"
+            add_issue "error" "API key invalid or expired" "Check your ANTHROPIC_API_KEY"
+        else
+            _box_row_kv "$(_check_fail)" "Anthropic API" "unreachable" "(HTTP $response)"
+            add_issue "error" "Cannot reach Anthropic API" "Check network/proxy settings"
+        fi
+    else
+        _box_row_kv "$(_check_skip)" "Anthropic API" "skipped" "no curl or key"
+    fi
+    
+    _box_row ""
+}
+
+# ============================================================================
+# Output
+# ============================================================================
+
+print_header() {
+    echo ""
+    printf "${CYAN}${BOX_TL}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_TR}${NC}\n"
+    _box_row ""
+    _box_row "${BOLD}🩺 Hive Doctor${NC}"
+    _box_row ""
+    _box_row "${DIM}Checking your setup...${NC}"
+    _box_row ""
+}
+
+print_footer() {
+    printf "${CYAN}${BOX_BL}"
+    printf "${BOX_H}%.0s" {1..53}
+    printf "${BOX_BR}${NC}\n"
+}
+
+print_summary() {
+    echo ""
+    
+    if [ $ERRORS -eq 0 ] && [ $WARNINGS -eq 0 ]; then
+        echo -e "  ${GREEN}${BOLD}All checks passed!${NC} You're ready to run Hive."
+    elif [ $ERRORS -eq 0 ]; then
+        echo -e "  ${GREEN}✓${NC} Ready with ${YELLOW}${WARNINGS} warning(s)${NC}"
+    else
+        echo -e "  ${RED}✗${NC} ${RED}${ERRORS} error(s)${NC}, ${YELLOW}${WARNINGS} warning(s)${NC}"
+    fi
+    
+    echo ""
+    
+    # Print issues
+    for issue in "${ISSUES[@]}"; do
+        IFS='|' read -r severity message fix <<< "$issue"
+        case "$severity" in
+            error)
+                echo -e "  ${RED}✗${NC} $message"
+                [ -n "$fix" ] && echo -e "    ${DIM}→ $fix${NC}"
+                ;;
+            warning)
+                echo -e "  ${YELLOW}⚠${NC} $message"
+                [ -n "$fix" ] && echo -e "    ${DIM}→ $fix${NC}"
+                ;;
+            info)
+                echo -e "  ${BLUE}ℹ${NC} $message"
+                [ -n "$fix" ] && echo -e "    ${DIM}→ $fix${NC}"
+                ;;
+        esac
+    done
+    
+    echo ""
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+
+main() {
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fix)
+                FIX_MODE=true
+                shift
+                ;;
+            --json)
+                JSON_MODE=true
+                shift
+                ;;
+            --check)
+                CHECK_COMPONENT="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: hive doctor [--fix] [--json] [--check <component>]"
+                echo ""
+                echo "Options:"
+                echo "  --fix     Auto-fix issues where possible"
+                echo "  --json    Output in JSON format"
+                echo "  --check   Check specific component (claude, beads, api)"
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    
+    print_header
+    check_required
+    check_optional
+    check_configuration
+    check_project
+    check_connectivity
+    print_footer
+    print_summary
+    
+    # Exit code
+    if [ $ERRORS -gt 0 ]; then
+        exit 1
+    elif [ $WARNINGS -gt 0 ]; then
+        exit 2
+    else
+        exit 0
+    fi
+}
+
+main "$@"
