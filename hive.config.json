@@ -1,0 +1,22 @@
+{
+  "_comment": "Hive config - copy to project root to customize. Models: sonnet (default), opus (smart), haiku (fast)",
+  "models": {
+    "default": "sonnet",
+    "architect": "opus",
+    "implementer": "opus",
+    "reviewer": "sonnet",
+    "tester": "opus",
+    "e2e-tester": "opus",
+    "browser-validator": "sonnet",
+    "debugger": "sonnet",
+    "security": "opus",
+    "documenter": "sonnet"
+  },
+  "features": {
+    "testing_required": true,
+    "parallel_worktrees": true,
+    "auto_mode": false,
+    "cost_tracking": false
+  },
+  "cli_overrides": {}
+}
