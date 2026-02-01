@@ -258,7 +258,43 @@ EOF
 }
 EOF
             ;;
-        
+
+        "migration")
+            cat <<'EOF'
+{
+  "name": "migration",
+  "description": "Database migration workflow - plan and execute schema changes",
+  "phases": [
+    {
+      "name": "plan_migration",
+      "agent": "migrator",
+      "required": true,
+      "human_checkpoint_after": true,
+      "task": "Plan the database schema migration.\n\n1. Analyze the current schema\n2. Design the migration approach\n3. Generate migration files\n4. Create rollback script\n5. Document breaking changes"
+    },
+    {
+      "name": "build_check",
+      "type": "build_verify",
+      "required": true,
+      "on_failure": "debugger"
+    },
+    {
+      "name": "testing",
+      "agent": "tester",
+      "required": false,
+      "task": "Test the migration.\n\n1. Verify migration applies cleanly\n2. Test rollback works\n3. Check data integrity\n4. Verify application works with new schema"
+    },
+    {
+      "name": "review",
+      "agent": "reviewer",
+      "required": false,
+      "task": "Review the migration.\n\nCheck for:\n- Data safety (no accidental drops)\n- Rollback viability\n- Performance implications\n- Breaking changes documented"
+    }
+  ]
+}
+EOF
+            ;;
+
         *)
             echo ""
             return 1
@@ -269,13 +305,14 @@ EOF
 # List all available workflows
 workflow_list() {
     echo "Built-in workflows:"
-    echo "  feature   Full pipeline: architect → implement → UI → test → review → docs"
-    echo "  bugfix    Bug fix: debugger → test"
-    echo "  refactor  Refactoring: architect → implement → test → review"
-    echo "  test      Testing only: tester"
-    echo "  review    Code review only: reviewer"
-    echo "  quick     Minimal: implement → build check"
-    echo "  docs      Documentation: documenter → review"
+    echo "  feature    Full pipeline: architect → implement → UI → test → review → docs"
+    echo "  bugfix     Bug fix: debugger → test"
+    echo "  refactor   Refactoring: architect → implement → test → review"
+    echo "  test       Testing only: tester"
+    echo "  review     Code review only: reviewer"
+    echo "  quick      Minimal: implement → build check"
+    echo "  docs       Documentation: documenter → review"
+    echo "  migration  Database migration: migrator → test → review"
     
     # Check for custom workflows
     local has_custom=false

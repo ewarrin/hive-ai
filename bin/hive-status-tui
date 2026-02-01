@@ -489,12 +489,12 @@ _render_pipeline_at() {
     _empty_row
     row=$((row + 1))
     
-    for agent in architect implementer ui-designer tester reviewer documenter; do
+    for agent in architect implementer migrator ui-designer tester e2e-tester component-tester reviewer security debugger documenter; do
         local output_file="$HIVE_DIR/runs/$run_id/output/${agent}.txt"
-        
+
         local icon="${C_DIM}○${C_NC}"
         local summary=""
-        
+
         if [ -f "$output_file" ]; then
             if [ "$agent" = "$current_agent" ]; then
                 icon="${C_YELLOW}●${C_NC}"
@@ -503,9 +503,12 @@ _render_pipeline_at() {
                 icon="${C_GREEN}✓${C_NC}"
             fi
         fi
-        
+
+        # Only show agents that have output or are current
+        [ ! -f "$output_file" ] && [ "$agent" != "$current_agent" ] && continue
+
         tui_goto $row 0
-        _row "  $icon $(printf '%-12s' "$agent")  ${C_DIM}$summary${C_NC}"
+        _row "  $icon $(printf '%-16s' "$agent")  ${C_DIM}$summary${C_NC}"
         row=$((row + 1))
     done
     
@@ -764,23 +767,23 @@ render_timeline_view() {
     # Show each agent's timing from output files
     local output_dir="$HIVE_DIR/runs/$run_id/output"
     
-    for agent in architect implementer ui-designer tester reviewer documenter; do
+    for agent in architect implementer migrator ui-designer tester e2e-tester component-tester reviewer security debugger documenter; do
         local output_file="$output_dir/${agent}_attempt_1.md"
         [ ! -f "$output_file" ] && continue
-        
+
         # Get file timestamps
         local mtime=$(stat -f %m "$output_file" 2>/dev/null || stat -c %Y "$output_file" 2>/dev/null || echo "0")
         local size=$(wc -c < "$output_file" 2>/dev/null | tr -d ' ')
         local time_fmt=$(date -r "$mtime" "+%H:%M:%S" 2>/dev/null || date -d "@$mtime" "+%H:%M:%S" 2>/dev/null || echo "??:??:??")
-        
+
         local icon="${C_GREEN}✓${C_NC}"
         local status_text="done"
-        
+
         if [ "$agent" = "$current_agent" ]; then
             icon="${C_YELLOW}●${C_NC}"
             status_text="running"
         fi
-        
+
         # Estimate tokens (rough: 4 chars per token)
         local tokens=$((size / 4))
         local tokens_fmt=""
@@ -789,12 +792,12 @@ render_timeline_view() {
         else
             tokens_fmt="~${tokens} tokens"
         fi
-        
+
         tui_goto $row 0
-        _row "  $icon $(printf '%-14s' "$agent") ${C_DIM}$time_fmt  $tokens_fmt${C_NC}"
+        _row "  $icon $(printf '%-16s' "$agent") ${C_DIM}$time_fmt  $tokens_fmt${C_NC}"
         echo ""
         row=$((row + 1))
-        
+
         [ $row -ge $((TERM_ROWS - 5)) ] && break
     done
     

@@ -28,25 +28,25 @@ _log_get_trace_context() {
 
     # Try to get run_id from scratchpad if not in env
     if [ -z "$run_id" ] && [ -f "$HIVE_DIR/scratchpad.json" ]; then
-        run_id=$(jq -r '.run_id // empty' "$HIVE_DIR/scratchpad.json" 2>/dev/null || echo "")
+        # Validate file is valid JSON first
+        if jq empty "$HIVE_DIR/scratchpad.json" 2>/dev/null; then
+            run_id=$(jq -r '.run_id // empty' "$HIVE_DIR/scratchpad.json" 2>/dev/null) || run_id=""
+        fi
     fi
 
     # Try to get trace_id from scratchpad if not in env
     if [ -z "$trace_id" ] && [ -f "$HIVE_DIR/scratchpad.json" ]; then
-        trace_id=$(jq -r '.trace_id // empty' "$HIVE_DIR/scratchpad.json" 2>/dev/null || echo "")
+        if jq empty "$HIVE_DIR/scratchpad.json" 2>/dev/null; then
+            trace_id=$(jq -r '.trace_id // empty' "$HIVE_DIR/scratchpad.json" 2>/dev/null) || trace_id=""
+        fi
     fi
 
-    jq -cn \
-        --arg run_id "$run_id" \
-        --arg trace_id "$trace_id" \
-        --arg span_id "$span_id" \
-        --arg parent_span_id "$parent_span_id" \
-        '{
-            run_id: (if $run_id != "" then $run_id else null end),
-            trace_id: (if $trace_id != "" then $trace_id else null end),
-            span_id: (if $span_id != "" then $span_id else null end),
-            parent_span_id: (if $parent_span_id != "" then $parent_span_id else null end)
-        }'
+    # Build context JSON - use printf to avoid jq issues with empty values
+    printf '{"run_id":%s,"trace_id":%s,"span_id":%s,"parent_span_id":%s}' \
+        "$([ -n "$run_id" ] && echo "\"$run_id\"" || echo "null")" \
+        "$([ -n "$trace_id" ] && echo "\"$trace_id\"" || echo "null")" \
+        "$([ -n "$span_id" ] && echo "\"$span_id\"" || echo "null")" \
+        "$([ -n "$parent_span_id" ] && echo "\"$parent_span_id\"" || echo "null")"
 }
 
 # ============================================================================
@@ -69,12 +69,18 @@ log_event() {
         data="{}"
     fi
 
-    # Get trace context
-    local trace_ctx=$(_log_get_trace_context)
+    # Get trace context (with fallback to empty object)
+    local trace_ctx
+    trace_ctx=$(_log_get_trace_context 2>/dev/null) || trace_ctx="{}"
+
+    # Validate trace_ctx is valid JSON
+    if ! echo "$trace_ctx" | jq empty 2>/dev/null; then
+        trace_ctx="{}"
+    fi
 
     # Build the event JSON with trace context
     local event
-    if [ -n "$duration_ms" ]; then
+    if [ -n "$duration_ms" ] && [ "$duration_ms" -eq "$duration_ms" ] 2>/dev/null; then
         event=$(jq -cn \
             --arg ts "$timestamp" \
             --arg event "$event_type" \
@@ -82,7 +88,7 @@ log_event() {
             --argjson trace_ctx "$trace_ctx" \
             --argjson duration_ms "$duration_ms" \
             '{ts: $ts, event: $event} + $trace_ctx + {duration_ms: $duration_ms} + $data'
-        )
+        ) 2>/dev/null
     else
         event=$(jq -cn \
             --arg ts "$timestamp" \
@@ -90,7 +96,12 @@ log_event() {
             --argjson data "$data" \
             --argjson trace_ctx "$trace_ctx" \
             '{ts: $ts, event: $event} + $trace_ctx + $data'
-        )
+        ) 2>/dev/null
+    fi
+
+    # Fallback if jq failed
+    if [ -z "$event" ]; then
+        event="{\"ts\":\"$timestamp\",\"event\":\"$event_type\"}"
     fi
 
     # Append to events file
