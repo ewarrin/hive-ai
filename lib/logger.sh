@@ -345,6 +345,20 @@ log_challenge_resolved() {
     )"
 }
 
+# Smart orchestrator decision logging
+log_smart_decision() {
+    local decision_type="$1"  # skip, budget, adapt, confidence
+    local details="$2"        # JSON
+    log_event "smart_decision" "$(jq -cn --arg t "$decision_type" --argjson d "$details" '{type: $t} + $d')"
+}
+
+log_phase_injected() {
+    local phase_name="$1"
+    local agent="$2"
+    local reason="$3"
+    log_event "phase_injected" "$(jq -cn --arg n "$phase_name" --arg a "$agent" --arg r "$reason" '{phase: $n, agent: $a, reason: $r}')"
+}
+
 # ============================================================================
 # Query Functions
 # ============================================================================

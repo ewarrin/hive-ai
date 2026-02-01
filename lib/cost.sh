@@ -8,6 +8,7 @@
 # ============================================================================
 
 HIVE_DIR="${HIVE_DIR:-.hive}"
+MEMORY_FILE="$HIVE_DIR/memory.json"
 
 # Pricing per 1M tokens (as of 2024 - update as needed)
 # Claude 3.5 Sonnet pricing
@@ -117,6 +118,9 @@ cost_record_agent() {
        .total_output_tokens += $output |
        .total_cost_usd = (.total_cost_usd + $cost | . * 1000000 | floor | . / 1000000)
        ' "$cost_file" > "$tmp" && mv "$tmp" "$cost_file"
+
+    # Update agent cost averages in memory for smart scheduling
+    cost_update_agent_average "$agent" "$input_tokens" "$output_tokens" "$total_cost"
 }
 
 # Record from prompt file and output file
@@ -259,6 +263,73 @@ cost_print_detailed() {
     echo ""
     echo -e "  ${BOLD}Total:  ${GREEN}$(format_cost $total_cost)${NC}"
     echo ""
+}
+
+# ============================================================================
+# Smart Orchestrator - Agent Cost Tracking
+# ============================================================================
+
+# Update running average for agent costs in memory
+cost_update_agent_average() {
+    local agent="$1"
+    local input_tokens="$2"
+    local output_tokens="$3"
+    local cost="$4"
+
+    [ ! -f "$MEMORY_FILE" ] && return 0
+
+    local mem=$(cat "$MEMORY_FILE")
+    echo "$mem" | jq --arg a "$agent" \
+        --argjson i "$input_tokens" --argjson o "$output_tokens" --argjson c "$cost" '
+        .agent_costs[$a] = {
+            avg_input: (((.agent_costs[$a].avg_input // 0) * (.agent_costs[$a].runs // 0) + $i) / ((.agent_costs[$a].runs // 0) + 1)),
+            avg_output: (((.agent_costs[$a].avg_output // 0) * (.agent_costs[$a].runs // 0) + $o) / ((.agent_costs[$a].runs // 0) + 1)),
+            avg_cost: (((.agent_costs[$a].avg_cost // 0) * (.agent_costs[$a].runs // 0) + $c) / ((.agent_costs[$a].runs // 0) + 1)),
+            runs: ((.agent_costs[$a].runs // 0) + 1)
+        }
+    ' > "$MEMORY_FILE"
+}
+
+# Get estimated cost for an agent
+cost_get_agent_estimate() {
+    local agent="$1"
+
+    if [ -f "$MEMORY_FILE" ]; then
+        cat "$MEMORY_FILE" | jq -r --arg a "$agent" '.agent_costs[$a].avg_cost // 0.20'
+    else
+        echo "0.20"
+    fi
+}
+
+# Check if running agent fits within remaining budget
+cost_fits_budget() {
+    local agent="$1"
+    local spent="$2"
+    local budget="${HIVE_COST_BUDGET:-0}"
+
+    [ "$budget" = "0" ] && return 0  # No budget = always fits
+
+    local estimate=$(cost_get_agent_estimate "$agent")
+    local remaining=$(awk -v b="$budget" -v s="$spent" 'BEGIN {print b - s}')
+    local fits=$(awk -v e="$estimate" -v r="$remaining" 'BEGIN {print (e <= r) ? 1 : 0}')
+
+    [ "$fits" = "1" ]
+}
+
+# Estimate total workflow cost
+cost_estimate_workflow() {
+    local workflow_type="$1"
+
+    # Need workflow.sh sourced for this
+    local phases=$(workflow_get "$workflow_type" 2>/dev/null | jq -r '.phases[].agent // empty' 2>/dev/null)
+    local total=0
+
+    for agent in $phases; do
+        local est=$(cost_get_agent_estimate "$agent")
+        total=$(awk -v t="$total" -v e="$est" 'BEGIN {print t + e}')
+    done
+
+    echo "$total"
 }
 
 # ============================================================================

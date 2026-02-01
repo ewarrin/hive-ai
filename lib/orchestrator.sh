@@ -38,6 +38,7 @@ source "$SCRIPT_DIR/parallel.sh"
 source "$SCRIPT_DIR/git.sh"
 source "$SCRIPT_DIR/agent_memory.sh"
 source "$SCRIPT_DIR/smart_select.sh"
+source "$SCRIPT_DIR/claude_updater.sh"
 
 # ============================================================================
 # Colors
@@ -114,18 +115,202 @@ beads_get_ready_tasks() {
 # Agent Execution
 # ============================================================================
 
+# Build role-appropriate context for an agent
+# Different agents need different context to work effectively
+curate_context_for_agent() {
+    local agent="$1"
+    local epic_id="$2"
+    local run_id="$3"
+    local handoff_id="$4"
+    local objective="$5"
+
+    local context=""
+
+    # Common: user-provided context files (always included)
+    if [ -n "${HIVE_CONTEXT_FILES:-}" ]; then
+        for ctx_file in $HIVE_CONTEXT_FILES; do
+            if [ -f "$ctx_file" ]; then
+                context="$context
+
+## Reference: $(basename "$ctx_file")
+$(cat "$ctx_file")"
+            fi
+        done
+    fi
+
+    case "$agent" in
+        architect)
+            # Maximum context for planning - needs full picture
+            local mem_context=$(memory_context_for_agent)
+            local idx_context=$(index_context_for_agent)
+            [ -n "$mem_context" ] && context="$context
+
+$mem_context"
+            [ -n "$idx_context" ] && context="$context
+
+$idx_context"
+            [ -f "CLAUDE.md" ] && context="$context
+
+## Project Guidelines (CLAUDE.md)
+$(cat CLAUDE.md)"
+            ;;
+
+        implementer)
+            # Architect's plan, relevant files, test patterns, mistake history
+            local agent_ctx=$(agent_memory_context "$agent" 2>/dev/null)
+            [ -n "$agent_ctx" ] && context="$context
+$agent_ctx"
+            # Index for file structure awareness
+            local idx_context=$(index_context_for_agent)
+            [ -n "$idx_context" ] && context="$context
+
+$idx_context"
+            # Memory for conventions and gotchas
+            local mem_context=$(memory_context_for_agent)
+            [ -n "$mem_context" ] && context="$context
+
+$mem_context"
+            ;;
+
+        tester|e2e-tester|component-tester)
+            # Diff only, implementer notes, test framework info
+            local diff_ctx=$(diff_context_for_agent "$run_id" "current")
+            [ -n "$diff_ctx" ] && context="$context
+
+$diff_ctx"
+            local test_cmd=$(memory_get_test_command)
+            [ -n "$test_cmd" ] && context="$context
+
+## Test Command
+\`$test_cmd\`"
+            # Agent-specific memory for common test issues
+            local agent_ctx=$(agent_memory_context "$agent" 2>/dev/null)
+            [ -n "$agent_ctx" ] && context="$context
+$agent_ctx"
+            ;;
+
+        reviewer|security)
+            # Objective, diff, architect plan - focused on what changed
+            context="$context
+
+## Original Objective
+$objective"
+            local diff_ctx=$(diff_context_for_agent "$run_id" "current")
+            [ -n "$diff_ctx" ] && context="$context
+
+$diff_ctx"
+            # Agent-specific memory for common issues found
+            local agent_ctx=$(agent_memory_context "$agent" 2>/dev/null)
+            [ -n "$agent_ctx" ] && context="$context
+$agent_ctx"
+            ;;
+
+        documenter)
+            # CLAUDE.md style reference, minimal codebase context
+            [ -f "CLAUDE.md" ] && context="$context
+
+## Style Reference (CLAUDE.md)
+$(cat CLAUDE.md)"
+            local idx_context=$(index_context_for_agent)
+            [ -n "$idx_context" ] && context="$context
+
+$idx_context"
+            ;;
+
+        debugger)
+            # Focus on error context and relevant code
+            local mem_context=$(memory_context_for_agent)
+            local idx_context=$(index_context_for_agent)
+            [ -n "$mem_context" ] && context="$context
+
+$mem_context"
+            [ -n "$idx_context" ] && context="$context
+
+$idx_context"
+            # Agent-specific memory for common debugging patterns
+            local agent_ctx=$(agent_memory_context "$agent" 2>/dev/null)
+            [ -n "$agent_ctx" ] && context="$context
+$agent_ctx"
+            ;;
+
+        *)
+            # Default: project memory + index (full context)
+            local mem_context=$(memory_context_for_agent)
+            local idx_context=$(index_context_for_agent)
+            [ -n "$mem_context" ] && context="$context
+
+$mem_context"
+            [ -n "$idx_context" ] && context="$context
+
+$idx_context"
+            [ -f "CLAUDE.md" ] && context="$context
+
+## Project Guidelines (CLAUDE.md)
+$(cat CLAUDE.md)"
+            ;;
+    esac
+
+    # Always add challenge history for this agent (all agents)
+    local challenge_ctx=$(memory_challenge_context_for "$agent" 2>/dev/null)
+    [ -n "$challenge_ctx" ] && context="$context
+$challenge_ctx"
+
+    # Always add agent-specific memory warnings
+    local agent_warnings=$(agent_memory_get_warnings "$agent" 2>/dev/null)
+    [ -n "$agent_warnings" ] && context="$context
+
+## Warnings from Previous Runs
+$agent_warnings"
+
+    echo "$context"
+}
+
+# Resolve agent prompt file with framework-aware fallback chain
+# Priority: 1. Project-local specialized (e.g., .hive/agents/implementer-nuxt.md)
+#           2. Project-local generic
+#           3. Global specialized (e.g., ~/.hive/global/agents/implementer-nuxt.md)
+#           4. Global generic
+#           5. Bundled fallback
+resolve_agent_prompt() {
+    local agent="$1"
+    local framework=$(memory_read 2>/dev/null | jq -r '.project.framework // ""' 2>/dev/null)
+
+    # 1. Project-local specialized (e.g., .hive/agents/implementer-nuxt.md)
+    if [ -n "$framework" ] && [ -f "$HIVE_DIR/agents/${agent}-${framework}.md" ]; then
+        echo "$HIVE_DIR/agents/${agent}-${framework}.md"
+        return
+    fi
+
+    # 2. Project-local generic
+    if [ -f "$HIVE_DIR/agents/${agent}.md" ]; then
+        echo "$HIVE_DIR/agents/${agent}.md"
+        return
+    fi
+
+    # 3. Global specialized (e.g., ~/.hive/global/agents/implementer-nuxt.md)
+    if [ -n "$framework" ] && [ -f "$HIVE_ROOT/global/agents/${agent}-${framework}.md" ]; then
+        echo "$HIVE_ROOT/global/agents/${agent}-${framework}.md"
+        return
+    fi
+
+    # 4. Global generic
+    if [ -f "$HIVE_ROOT/global/agents/${agent}.md" ]; then
+        echo "$HIVE_ROOT/global/agents/${agent}.md"
+        return
+    fi
+
+    # 5. Bundled fallback
+    echo "$HIVE_ROOT/agents/${agent}.md"
+}
+
 run_agent() {
     local agent="$1"
     local task="$2"
     local handoff_id="$3"
     local output_file="$4"
-    
-    local agent_prompt="$HIVE_ROOT/agents/${agent}.md"
-    
-    # Allow project-local agent overrides
-    if [ -f "$HIVE_DIR/agents/${agent}.md" ]; then
-        agent_prompt="$HIVE_DIR/agents/${agent}.md"
-    fi
+
+    # Resolve agent prompt with framework-aware fallback
+    local agent_prompt=$(resolve_agent_prompt "$agent")
     
     if [ ! -f "$agent_prompt" ]; then
         print_error "Agent not found: $agent"
@@ -139,50 +324,14 @@ run_agent() {
     local run_id=$(scratchpad_get "run_id")
     
     system_prompt="${system_prompt//\{\{EPIC_ID\}\}/$epic_id}"
-    
-    # Build context
-    local context=""
-    
-    # Add user-provided context files
-    if [ -n "${HIVE_CONTEXT_FILES:-}" ]; then
-        for ctx_file in $HIVE_CONTEXT_FILES; do
-            if [ -f "$ctx_file" ]; then
-                local filename=$(basename "$ctx_file")
-                context="$context
 
-## Reference Document: $filename
+    # Build context using role-appropriate curation
+    local context=$(curate_context_for_agent "$agent" "$epic_id" "$run_id" "$handoff_id" "$objective")
 
-$(cat "$ctx_file")"
-            fi
-        done
-    fi
-    
-    # Add project memory
-    local mem_context=$(memory_context_for_agent)
-    if [ -n "$mem_context" ]; then
-        context="$context
-
-$mem_context"
-    fi
-
-    # Add challenge history context (past challenges against this agent)
-    local challenge_ctx=$(memory_challenge_context_for "$agent" 2>/dev/null)
-    if [ -n "$challenge_ctx" ]; then
-        context="$context
-$challenge_ctx"
-    fi
-
-    # Add codebase index
-    local idx_context=$(index_context_for_agent)
-    if [ -n "$idx_context" ]; then
-        context="$context
-
-$idx_context"
-    fi
-    
     # Run sub-agents for agents that have them (currently: architect)
     if agent_has_subagents "$agent"; then
         local project_mem=$(memory_read 2>/dev/null || echo "{}")
+        local idx_context=$(index_context_for_agent)
         local subagent_context=$(run_subagents_for_context "$agent" "$objective" "$idx_context" "$project_mem" "$epic_id")
         if [ -n "$subagent_context" ]; then
             context="$context
@@ -190,17 +339,16 @@ $idx_context"
 $subagent_context"
         fi
     fi
-    
-    # Add scratchpad summary
+
+    # Add scratchpad summary (always needed)
     local sp_summary=$(scratchpad_summary)
     context="$context
 
-## Current State (from Hive Scratchpad)
-
+## Current State (Hive Scratchpad)
 \`\`\`json
 $sp_summary
 \`\`\`"
-    
+
     # Add handoff if provided
     if [ -n "$handoff_id" ]; then
         local handoff_md=$(handoff_to_markdown "$handoff_id")
@@ -211,36 +359,16 @@ $handoff_md"
             handoff_mark_received "$handoff_id"
         fi
     fi
-    
-    # Add diff context for reviewers and testers
-    if [[ "$agent" == "reviewer" || "$agent" == "tester" || "$agent" == "e2e-tester" || "$agent" == "component-tester" ]]; then
-        local diff_ctx=$(diff_context_for_agent "$run_id" "current")
-        if [ -n "$diff_ctx" ]; then
-            context="$context
 
-$diff_ctx"
-        fi
-    fi
-    
     # Add Beads context
     local ready_tasks=$(beads_get_ready_tasks "$epic_id")
     if [ "$ready_tasks" != "[]" ]; then
         context="$context
 
-## Ready Tasks (from Beads)
-
+## Ready Tasks (Beads)
 \`\`\`json
 $ready_tasks
 \`\`\`"
-    fi
-    
-    # Add CLAUDE.md if exists
-    if [ -f "CLAUDE.md" ]; then
-        context="$context
-
-## Project Guidelines (from CLAUDE.md)
-
-$(cat CLAUDE.md)"
     fi
     
     # Build full prompt with self-eval instructions
@@ -359,6 +487,102 @@ List ALL files you modified, tasks you created/closed, and any decisions made."
 }
 
 # ============================================================================
+# Dynamic Workflow Adaptation
+# ============================================================================
+
+# Inject a phase into the workflow
+workflow_inject_phase() {
+    local phase_name="$1"
+    local agent="$2"
+    local reason="$3"
+
+    local phase=$(jq -cn --arg n "$phase_name" --arg a "$agent" --arg r "$reason" \
+        '{name: $n, agent: $a, required: false, injected: true, reason: $r}')
+
+    scratchpad_update ".injected_phases = ((.injected_phases // []) + [$phase])"
+    log_phase_injected "$phase_name" "$agent" "$reason"
+    print_info "Injected phase: $phase_name ($reason)"
+}
+
+# Check conditions after each agent and adapt workflow
+workflow_adapt_check() {
+    local agent="$1"
+    local report="$2"
+    local run_id="$3"
+
+    [ "${HIVE_ADAPT_ENABLED:-1}" != "1" ] && return 0
+
+    # Trigger 1: Many files modified -> extra review
+    local files_count=$(echo "$report" | jq '[.files_modified // []] | flatten | length' 2>/dev/null || echo "0")
+    if [ "$files_count" -gt "${HIVE_ADAPT_MANY_FILES:-10}" ]; then
+        log_smart_decision "adapt" "$(jq -cn --argjson n "$files_count" '{trigger: "many_files", count: $n}')"
+        workflow_inject_phase "extra_review" "reviewer" "Extra review due to $files_count files modified"
+    fi
+
+    # Trigger 2: Repeated test failures -> escalate
+    if [ "$agent" = "tester" ] || [ "$agent" = "e2e-tester" ]; then
+        local status=$(echo "$report" | jq -r '.status // "unknown"')
+        if [ "$status" = "blocked" ] || [ "$status" = "partial" ]; then
+            local failures=$(scratchpad_get "test_failure_count" 2>/dev/null || echo "0")
+            failures=$((failures + 1))
+            scratchpad_set "test_failure_count" "$failures"
+
+            if [ "$failures" -ge "${HIVE_ADAPT_MAX_FAILURES:-3}" ]; then
+                log_smart_decision "adapt" "$(jq -cn --argjson n "$failures" '{trigger: "test_failures", count: $n}')"
+                print_warn "Tests failed $failures times - escalating"
+            fi
+        fi
+    fi
+
+    # Trigger 3: Security issues -> add security phase
+    local security_issues=$(echo "$report" | jq '[.issues_found // [] | .[] | select(.severity == "critical" or .severity == "high")] | length' 2>/dev/null || echo "0")
+    if [ "$security_issues" -gt 0 ] && [ "$agent" != "security" ]; then
+        if ! scratchpad_get "security_phase_added" &>/dev/null; then
+            log_smart_decision "adapt" "$(jq -cn --argjson n "$security_issues" '{trigger: "security_issues", count: $n}')"
+            workflow_inject_phase "security_review" "security" "Security review due to $security_issues high/critical issues"
+            scratchpad_set "security_phase_added" "true"
+        fi
+    fi
+}
+
+# ============================================================================
+# Confidence-Gated Progression
+# ============================================================================
+
+# Check if confidence is below threshold and apply safety measures
+confidence_gate_check() {
+    local agent="$1"
+    local confidence="$2"
+    local run_id="$3"
+
+    local threshold="${HIVE_CONFIDENCE_THRESHOLD:-0.6}"
+
+    # Use awk for portable float comparison
+    local is_low=$(awk -v c="$confidence" -v t="$threshold" 'BEGIN {print (c < t) ? 1 : 0}')
+
+    if [ "$is_low" = "1" ]; then
+        log_smart_decision "confidence" "$(jq -cn --arg a "$agent" --arg c "$confidence" --arg t "$threshold" \
+            '{agent: $a, confidence: $c, threshold: $t, action: "safety_measures"}')"
+
+        # 1. Disable parallel execution for remaining phases
+        export HIVE_PARALLEL=0
+
+        # 2. Mark for extra review
+        scratchpad_set "needs_extra_review" "true"
+        scratchpad_set "low_confidence_agent" "$agent"
+
+        # 3. Trigger checkpoint if configured
+        if [ "${HIVE_CONFIDENCE_CHECKPOINT:-1}" = "1" ] && [ "${HIVE_AUTO_MODE:-0}" != "1" ]; then
+            print_warn "$agent reported low confidence ($confidence)"
+            human_checkpoint "Low Confidence" "$agent reported confidence $confidence (threshold: $threshold). Review before continuing."
+        fi
+
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================================
 # Validation & Retry Loop (v2 - Self-Eval Primary)
 # ============================================================================
 
@@ -401,7 +625,10 @@ run_agent_with_validation() {
                     "pass"|"pass_low_confidence")
                         local confidence=$(echo "$report" | jq -r '.confidence // 0')
                         local summary=$(echo "$report" | jq -r '.summary // ""')
-                        
+
+                        # Check confidence gate for safety measures
+                        confidence_gate_check "$agent" "$confidence" "$run_id" || true
+
                         if [ "$eval_result" == "pass_low_confidence" ]; then
                             print_warn "$agent completed with low confidence ($confidence)"
                         else
@@ -530,8 +757,15 @@ Previous output is in: $output_file"
     
     print_error "$agent failed after $max_attempts attempts"
     memory_record_agent_run "$agent" "0" "false" "$max_attempts"
+
+    # Record failure in agent memory for pattern learning
+    local last_report=$(selfeval_extract "$output_file" 2>/dev/null)
+    if [ -n "$last_report" ]; then
+        agent_memory_learn_from_report "$agent" "$last_report" "false"
+    fi
+
     checkpoint_on_failure "$agent" "Max retries exceeded" $max_attempts
-    
+
     return 1
 }
 
@@ -1204,6 +1438,15 @@ run_workflow() {
     echo "$workflow_def" | jq -c '.phases[]' > "$phases_file"
     
     while IFS= read -r phase_json; do
+        # Check for injected phases first (from workflow adaptation)
+        local injected=$(scratchpad_get "injected_phases" 2>/dev/null | jq -c '.[0] // empty' 2>/dev/null)
+        if [ -n "$injected" ] && [ "$injected" != "null" ] && [ "$injected" != "" ]; then
+            # Pop first injected phase and use it instead
+            scratchpad_update '.injected_phases = (.injected_phases[1:] // [])'
+            phase_json="$injected"
+            print_info "Processing injected phase..."
+        fi
+
         local phase_name=$(echo "$phase_json" | jq -r '.name')
         local phase_type=$(echo "$phase_json" | jq -r '.type // "agent"')
         local phase_agent=$(echo "$phase_json" | jq -r '.agent // ""')
@@ -1255,14 +1498,45 @@ run_workflow() {
         scratchpad_set_phase "$phase_name"
         progress_set_agent "$phase_agent"
         progress_set_phase "$phase_name ($phase_num/$total_phases)"
-        
+
+        # Cost-aware budget check
+        if [ "${HIVE_COST_AWARE:-0}" = "1" ]; then
+            local spent=$(cost_get_total "$run_id")
+            if ! cost_fits_budget "$phase_agent" "$spent"; then
+                if [ "$phase_required" != "true" ]; then
+                    log_smart_decision "budget" "$(jq -cn --arg a "$phase_agent" --arg s "$spent" '{agent: $a, spent: $s, action: "skipped"}')"
+                    print_warn "Skipping $phase_agent (over budget)"
+                    phase_num=$((phase_num + 1))
+                    continue
+                else
+                    print_warn "Budget exceeded but $phase_agent is required"
+                fi
+            fi
+        fi
+
+        # Predictive agent skipping (fast mode)
+        if [ "${HIVE_FAST_MODE:-0}" = "1" ] && [ "$phase_required" != "true" ]; then
+            if memory_is_skip_safe "$phase_agent" "$objective"; then
+                log_smart_decision "skip" "$(jq -cn --arg a "$phase_agent" '{agent: $a, reason: "high_success_pattern"}')"
+                print_info "Skipping $phase_agent (fast mode: high success pattern)"
+                phase_num=$((phase_num + 1))
+                continue
+            fi
+        fi
+
         # Template variables
         phase_task="${phase_task//\{\{EPIC_ID\}\}/$epic_id}"
         [ -z "$phase_task" ] && phase_task="Execute your role for: $objective"
-        
+
         # Build handoff
         local handoff_id=""
         if [ -n "$needs_handoff" ] && [ "$needs_handoff" != "null" ]; then
+            # Check for pair performance warnings
+            local pair_warning=$(memory_get_pair_warning "$needs_handoff" "$phase_agent")
+            if [ -n "$pair_warning" ]; then
+                print_warn "$pair_warning"
+            fi
+
             case "${needs_handoff}_${phase_agent}" in
                 architect_implementer)
                     handoff_id=$(handoff_architect_to_implementer "Ready for implementation" "$epic_id")
@@ -1370,11 +1644,23 @@ Continue anyway?"; then
         if [ -n "$phase_agent" ]; then
             local agent_summary=$(selfeval_extract "$HIVE_DIR/runs/$run_id/output/${phase_agent}.txt" | jq -r '.summary // "Completed phase"' 2>/dev/null | head -c 50)
             git_commit_phase "$phase_agent" "${agent_summary:-Completed $phase_name}" "$run_id"
-            
+
             # Update agent memory
             local report=$(selfeval_extract "$HIVE_DIR/runs/$run_id/output/${phase_agent}.txt" 2>/dev/null)
             if [ -n "$report" ]; then
                 agent_memory_learn_from_report "$phase_agent" "$report" "true"
+                # Check for workflow adaptation triggers
+                workflow_adapt_check "$phase_agent" "$report" "$run_id"
+
+                # Record outcome for predictive skipping
+                local was_challenged="false"
+                [ -n "${HIVE_CHALLENGE_FROM:-}" ] && was_challenged="true"
+                memory_record_skip_outcome "$phase_agent" "$objective" "true" "$was_challenged"
+
+                # Record pair performance for handoff patterns
+                if [ -n "$last_agent" ]; then
+                    memory_record_pair_performance "$last_agent" "$phase_agent" "$was_challenged"
+                fi
             fi
         fi
         
@@ -1460,7 +1746,13 @@ Continue anyway?"; then
     echo ""
     local report_file=$(postmortem_generate "$run_id" "$epic_id")
     print_info "Report: $report_file"
-    
+
+    # Aggregate agent patterns for compounding knowledge
+    memory_aggregate_agent_patterns "$run_id"
+
+    # Update CLAUDE.md with learnings
+    update_claude_md_from_run "$run_id" "$epic_id"
+
     echo ""
     echo -e "${BOLD}Agent Summary:${NC}"
     postmortem_print_summary "$run_id" "$epic_id"

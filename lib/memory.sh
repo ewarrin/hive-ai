@@ -8,6 +8,29 @@ HIVE_DIR="${HIVE_DIR:-.hive}"
 MEMORY_FILE="$HIVE_DIR/memory.json"
 
 # ============================================================================
+# Schema Migration
+# ============================================================================
+
+# Migrate memory.json to latest schema
+memory_migrate_schema() {
+    [ ! -f "$MEMORY_FILE" ] && return 0
+
+    local current=$(cat "$MEMORY_FILE")
+    local version=$(echo "$current" | jq -r '.schema_version // 0')
+
+    # v1: Add smart orchestrator fields
+    if [ "$version" -lt 1 ]; then
+        echo "$current" | jq '
+            .schema_version = 1 |
+            .agent_costs = (.agent_costs // {}) |
+            .skip_patterns = (.skip_patterns // {}) |
+            .pair_performance = (.pair_performance // {}) |
+            .objective_patterns = (.objective_patterns // {})
+        ' > "$MEMORY_FILE"
+    fi
+}
+
+# ============================================================================
 # Core Memory Functions
 # ============================================================================
 
@@ -16,6 +39,7 @@ memory_init() {
     if [ ! -f "$MEMORY_FILE" ]; then
         mkdir -p "$HIVE_DIR"
         jq -n '{
+            schema_version: 1,
             project: {
                 name: null,
                 type: null,
@@ -31,10 +55,17 @@ memory_init() {
             gotchas: [],
             file_map: {},
             agent_history: [],
+            agent_costs: {},
+            skip_patterns: {},
+            pair_performance: {},
+            objective_patterns: {},
             run_count: 0,
             created_at: (now | todate),
             updated_at: (now | todate)
         }' > "$MEMORY_FILE"
+    else
+        # Migrate existing memory to latest schema
+        memory_migrate_schema
     fi
 }
 
@@ -468,4 +499,152 @@ memory_challenge_context_for() {
 ## Past Challenges Against Your Work
 $history
 Pay extra attention to these areas."
+}
+
+# ============================================================================
+# Agent Pattern Aggregation
+# ============================================================================
+
+# Aggregate agent stats into memory after a run
+# This accumulates per-agent performance data for pattern tracking
+memory_aggregate_agent_patterns() {
+    local run_id="$1"
+
+    local events_file="$HIVE_DIR/events.jsonl"
+    [ ! -f "$events_file" ] && return 0
+
+    # Read events for this run and extract per-agent stats
+    local agent_stats=$(cat "$events_file" 2>/dev/null | jq -s --arg rid "$run_id" '
+        [.[] | select(.run_id == $rid and .event == "agent_selfeval")] |
+        if length == 0 then [] else
+            group_by(.agent) |
+            map({
+                agent: .[0].agent,
+                runs: length,
+                avg_confidence: ([.[].confidence // 0] | add / length),
+                statuses: ([.[].status] | group_by(.) | map({status: .[0], count: length}))
+            })
+        end' 2>/dev/null)
+
+    # Skip if no stats found
+    [ -z "$agent_stats" ] || [ "$agent_stats" = "[]" ] && return 0
+
+    # Merge with existing patterns in memory
+    local current=$(memory_read)
+    echo "$current" | jq --argjson stats "$agent_stats" '
+        .agent_patterns = (
+            (.agent_patterns // {}) as $existing |
+            ($stats | map({
+                key: .agent,
+                value: {
+                    total_runs: (($existing[.agent].total_runs // 0) + .runs),
+                    avg_confidence: (
+                        if ($existing[.agent].avg_confidence // 0) > 0 then
+                            (($existing[.agent].avg_confidence + .avg_confidence) / 2)
+                        else .avg_confidence end
+                    ),
+                    recent_statuses: .statuses,
+                    challenge_rate: ($existing[.agent].challenge_rate // 0)
+                }
+            }) | from_entries) + $existing
+        ) |
+        .updated_at = (now | todate)
+    ' > "$MEMORY_FILE"
+}
+
+# ============================================================================
+# Predictive Agent Skipping (Fast Mode)
+# ============================================================================
+
+# Record outcome for skip pattern learning
+memory_record_skip_outcome() {
+    local agent="$1"
+    local objective="$2"
+    local success="$3"        # true/false
+    local challenged="$4"     # true/false
+
+    # Extract key words from objective (4+ chars, first 3 unique)
+    local pattern=$(echo "$objective" | tr '[:upper:]' '[:lower:]' | grep -oE '\b[a-z]{4,}\b' | sort -u | head -3 | tr '\n' ' ' | xargs)
+    [ -z "$pattern" ] && return
+
+    local mem=$(memory_read)
+    echo "$mem" | jq --arg a "$agent" --arg p "$pattern" \
+        --argjson s "$success" --argjson c "$challenged" '
+        .skip_patterns[$a].patterns = (
+            (.skip_patterns[$a].patterns // []) |
+            (map(select(.pattern == $p)) | .[0]) as $existing |
+            if $existing then
+                map(if .pattern == $p then
+                    .samples += 1 |
+                    .successes += (if $s then 1 else 0 end) |
+                    .challenges += (if $c then 1 else 0 end) |
+                    .success_rate = (.successes / .samples) |
+                    .challenge_rate = (.challenges / .samples)
+                else . end)
+            else
+                . + [{pattern: $p, samples: 1, successes: (if $s then 1 else 0 end),
+                      challenges: (if $c then 1 else 0 end), success_rate: (if $s then 1 else 0 end),
+                      challenge_rate: (if $c then 1 else 0 end)}]
+            end
+        )[:20]
+    ' > "$MEMORY_FILE"
+}
+
+# Check if agent is safe to skip for this objective
+memory_is_skip_safe() {
+    local agent="$1"
+    local objective="$2"
+
+    local pattern=$(echo "$objective" | tr '[:upper:]' '[:lower:]' | grep -oE '\b[a-z]{4,}\b' | sort -u | head -3 | tr '\n' ' ' | xargs)
+
+    local min_samples="${HIVE_SKIP_MIN_SAMPLES:-10}"
+    local success_threshold="${HIVE_SKIP_SUCCESS_THRESHOLD:-0.95}"
+
+    local match=$(memory_read | jq -r --arg a "$agent" --arg p "$pattern" \
+        --argjson min "$min_samples" --argjson thresh "$success_threshold" '
+        .skip_patterns[$a].patterns // [] |
+        map(select(.pattern == $p and .samples >= $min and .success_rate >= $thresh and .challenge_rate <= 0.05)) |
+        if length > 0 then "true" else "false" end
+    ')
+
+    [ "$match" = "true" ]
+}
+
+# ============================================================================
+# Pair Performance Tracking
+# ============================================================================
+
+# Record pair performance after each handoff
+memory_record_pair_performance() {
+    local from_agent="$1"
+    local to_agent="$2"
+    local was_challenged="$3"
+
+    local pair="${from_agent}->${to_agent}"
+    local mem=$(memory_read)
+
+    echo "$mem" | jq --arg p "$pair" --argjson c "$was_challenged" '
+        .pair_performance[$p] = {
+            runs: ((.pair_performance[$p].runs // 0) + 1),
+            challenges: ((.pair_performance[$p].challenges // 0) + (if $c then 1 else 0 end)),
+            challenge_rate: (((.pair_performance[$p].challenges // 0) + (if $c then 1 else 0 end)) /
+                            ((.pair_performance[$p].runs // 0) + 1))
+        }
+    ' > "$MEMORY_FILE"
+}
+
+# Get warning if pair has high challenge rate
+memory_get_pair_warning() {
+    local from_agent="$1"
+    local to_agent="$2"
+
+    local pair="${from_agent}->${to_agent}"
+    local result=$(memory_read | jq -r --arg p "$pair" '
+        .pair_performance[$p] |
+        if . and .runs >= 5 and .challenge_rate >= 0.3 then
+            "Historically \(.challenge_rate * 100 | floor)% challenge rate for \($p)"
+        else empty end
+    ')
+
+    [ -n "$result" ] && echo "$result"
 }
