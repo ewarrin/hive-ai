@@ -41,6 +41,7 @@ source "$SCRIPT_DIR/smart_select.sh"
 source "$SCRIPT_DIR/claude_updater.sh"
 source "$SCRIPT_DIR/config.sh"
 source "$SCRIPT_DIR/invoke.sh"
+source "$SCRIPT_DIR/testing.sh"
 
 # ============================================================================
 # Colors
@@ -181,7 +182,7 @@ $idx_context"
 $mem_context"
             ;;
 
-        tester|e2e-tester|component-tester)
+        tester|e2e-tester|component-tester|browser-validator)
             # Diff only, implementer notes, test framework info
             local diff_ctx=$(diff_context_for_agent "$run_id" "current")
             [ -n "$diff_ctx" ] && context="$context
@@ -192,6 +193,14 @@ $diff_ctx"
 
 ## Test Command
 \`$test_cmd\`"
+            # Test infrastructure detection
+            local test_setup=$(testing_detect_setup 2>/dev/null)
+            [ -n "$test_setup" ] && context="$context
+
+## Test Infrastructure
+\`\`\`json
+$test_setup
+\`\`\`"
             # Agent-specific memory for common test issues
             local agent_ctx=$(agent_memory_context "$agent" 2>/dev/null)
             [ -n "$agent_ctx" ] && context="$context

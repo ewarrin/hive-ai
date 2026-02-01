@@ -57,10 +57,73 @@ E2E tests are expensive. Test the flows that matter.
 
 ## Phase 3: Write Tests
 
+### Setting Up Playwright (if not present)
+
+If Playwright is not configured, bootstrap it first:
+
 ```bash
-# Ensure dev server is running (or will be)
-npm run dev &
-# or Playwright config handles this with webServer
+# Install Playwright and browser
+npm install -D @playwright/test
+npx playwright install chromium
+
+# Create config with webServer (auto-starts dev server)
+cat > playwright.config.ts << 'EOF'
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './tests/e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  reporter: [['html'], ['list']],
+  use: {
+    baseURL: 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'on-first-retry',
+  },
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+  ],
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+    timeout: 120 * 1000,
+  },
+});
+EOF
+
+mkdir -p tests/e2e
+npm pkg set scripts.test:e2e="playwright test"
+npm pkg set scripts.test:e2e:headed="playwright test --headed"
+npm pkg set scripts.test:e2e:ui="playwright test --ui"
+npm pkg set scripts.test:e2e:debug="playwright test --debug"
+```
+
+### Running with Visible Browser
+
+Use these commands to see the browser as tests run:
+
+```bash
+# See the browser as tests run (headed mode)
+npx playwright test --headed
+
+# Interactive UI mode - best for debugging
+npx playwright test --ui
+
+# Debug mode - step through test line by line
+npx playwright test --debug
+
+# Run specific test file with visible browser
+npx playwright test tests/e2e/dashboard.spec.ts --headed
+```
+
+### Begin Writing Tests
+
+```bash
+# The webServer in playwright.config.ts auto-starts the dev server
+# No need to manually run npm run dev
 
 # Mark your task
 bd update <task-id> --status in_progress
@@ -166,11 +229,45 @@ await page.waitForTimeout(2000)
 # Run your new tests
 npx playwright test tests/e2e/dashboard.spec.ts
 
-# Run headed to see what's happening
+# Run headed to see what's happening (browser visible)
 npx playwright test tests/e2e/dashboard.spec.ts --headed
 
 # Run all E2E tests to check for regressions
 npx playwright test
+
+# Run with UI mode for interactive debugging
+npx playwright test --ui
+
+# Generate and view HTML report
+npx playwright show-report
+```
+
+### Visual Verification with Screenshots
+
+Take screenshots at key points to verify visual correctness:
+
+```typescript
+test('visual verification', async ({ page }) => {
+  await page.goto('/dashboard');
+
+  // Full page screenshot
+  await page.screenshot({ path: 'screenshots/dashboard.png', fullPage: true });
+
+  // Element screenshot
+  await page.locator('.header').screenshot({ path: 'screenshots/header.png' });
+
+  // Screenshot on assertion for debugging
+  await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+});
+```
+
+### Trace Viewer for Debugging Failures
+
+When a test fails, use the trace viewer:
+
+```bash
+# View trace from last failed test
+npx playwright show-trace test-results/test-name/trace.zip
 ```
 
 **If tests fail:**

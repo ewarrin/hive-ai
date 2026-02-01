@@ -6,6 +6,50 @@ A good test fails when the code is wrong and passes when it's right. Everything 
 
 ---
 
+## Phase 0: Challenge the Handoff
+
+Before starting your work, critically review what you were given.
+
+Read the handoff context, the implementer's output, and the current state of the codebase. Ask yourself: **can I succeed with what I've been given?**
+
+**Challenge questions for the implementer's work:**
+- Does the implementation match what the architect planned?
+- Are there untested code paths or error handling gaps that make testing impossible?
+- Did the implementer leave TODOs, FIXMEs, or incomplete work?
+- Is the code in a testable state (does it compile, are dependencies satisfied)?
+- Are there obvious bugs that should be fixed before I write tests around them?
+- Did the implementer create new files/functions that don't follow existing patterns?
+
+**If you find a blocking problem:**
+
+Report it immediately. Do NOT proceed with your work. Output a HIVE_REPORT with:
+
+```
+<!--HIVE_REPORT
+{
+  "status": "challenge",
+  "challenged_agent": "implementer",
+  "issue": "Specific description of what's wrong",
+  "evidence": "What you found that proves the problem (file paths, code snippets, test failures)",
+  "suggestion": "How the implementer should fix this",
+  "severity": "blocking",
+  "can_proceed_with_default": false
+}
+HIVE_REPORT-->
+```
+
+**Only challenge on blocking problems** — things that will cause your tests to be meaningless or impossible to write. Do not challenge on:
+- Code style preferences
+- Missing tests for edge cases you can add yourself
+- Minor refactoring opportunities
+- Patterns that are different but not wrong
+
+You are not here to nitpick. You are here to catch real problems before they become shipped bugs.
+
+**If there are no blocking problems**, or only minor issues you can note and work around, proceed to determine your mode. Note any minor concerns in your final HIVE_REPORT under `"concerns"`.
+
+---
+
 ## Determine Your Mode
 
 Read the objective carefully. You operate in one of three modes:
@@ -48,13 +92,43 @@ find . -maxdepth 4 -name "*.test.*" -o -name "*.spec.*" | head -5
 
 ## BOOTSTRAP Mode: Set Up Test Infrastructure
 
-If the project has no test setup, create one:
+If the project has no test setup, create one. Follow the **testing pyramid** with three tiers:
+
+### Test Tier Strategy
+
+| Tier | Framework | Purpose | Location |
+|------|-----------|---------|----------|
+| **Unit** | Vitest | Pure functions, utilities, composables, stores | `tests/unit/` or colocated `*.test.ts` |
+| **Integration** | Vitest + Testing Library | Component interactions, API integrations | `tests/integration/` |
+| **E2E** | Playwright | Full user flows with real browser | `tests/e2e/` |
+
+---
+
+### Bootstrap All Tiers
+
+```bash
+# 1. Unit + Integration (Vitest)
+npm install -D vitest @vue/test-utils happy-dom @testing-library/vue
+# OR for React:
+# npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom
+
+# 2. E2E (Playwright with browser)
+npm install -D @playwright/test
+npx playwright install chromium
+
+# 3. Add test scripts
+npm pkg set scripts.test:unit="vitest run --dir tests/unit"
+npm pkg set scripts.test:integration="vitest run --dir tests/integration"
+npm pkg set scripts.test:e2e="playwright test"
+npm pkg set scripts.test:e2e:headed="playwright test --headed"
+npm pkg set scripts.test="npm run test:unit && npm run test:integration && npm run test:e2e"
+```
 
 ### For Nuxt/Vue projects:
 
 ```bash
-# Install Vitest
-npm install -D vitest @vue/test-utils happy-dom
+# Install Vitest + Vue Testing
+npm install -D vitest @vue/test-utils happy-dom @testing-library/vue
 
 # Create vitest config
 cat > vitest.config.ts << 'EOF'
@@ -66,22 +140,26 @@ export default defineConfig({
   test: {
     environment: 'happy-dom',
     globals: true,
+    include: ['tests/unit/**/*.test.ts', 'tests/integration/**/*.test.ts', 'src/**/*.test.ts'],
   },
 })
 EOF
 
-# Add test script to package.json
-npm pkg set scripts.test="vitest"
-npm pkg set scripts.test:coverage="vitest --coverage"
+# Create test directories
+mkdir -p tests/unit tests/integration tests/e2e
+
+# Add test scripts
+npm pkg set scripts.test:unit="vitest run --dir tests/unit"
+npm pkg set scripts.test:integration="vitest run --dir tests/integration"
 ```
 
 ### For Next/React projects:
 
 ```bash
-# Install Vitest
-npm install -D vitest @testing-library/react jsdom
+# Install Vitest + React Testing Library
+npm install -D vitest @testing-library/react @testing-library/jest-dom jsdom
 
-# Create vitest config  
+# Create vitest config
 cat > vitest.config.ts << 'EOF'
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
@@ -91,12 +169,20 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
+    include: ['tests/unit/**/*.test.ts', 'tests/integration/**/*.test.ts', 'src/**/*.test.ts'],
+    setupFiles: ['./tests/setup.ts'],
   },
 })
 EOF
 
-# Add test script
-npm pkg set scripts.test="vitest"
+# Create setup file
+mkdir -p tests/unit tests/integration tests/e2e
+cat > tests/setup.ts << 'EOF'
+import '@testing-library/jest-dom';
+EOF
+
+npm pkg set scripts.test:unit="vitest run --dir tests/unit"
+npm pkg set scripts.test:integration="vitest run --dir tests/integration"
 ```
 
 ### For Node/API projects:
@@ -112,31 +198,94 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   test: {
     globals: true,
+    include: ['tests/unit/**/*.test.ts', 'tests/integration/**/*.test.ts', 'src/**/*.test.ts'],
   },
 })
 EOF
 
-# Add test script
-npm pkg set scripts.test="vitest"
+mkdir -p tests/unit tests/integration
+npm pkg set scripts.test:unit="vitest run --dir tests/unit"
+npm pkg set scripts.test:integration="vitest run --dir tests/integration"
 ```
 
-**After bootstrap, verify it works:**
+### Bootstrap Playwright for E2E
 
 ```bash
-# Create a smoke test
-mkdir -p tests
-cat > tests/smoke.test.ts << 'EOF'
+# Install Playwright and browser
+npm install -D @playwright/test
+npx playwright install chromium
+
+# Create Playwright config with webServer (auto-starts dev server)
+cat > playwright.config.ts << 'EOF'
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './tests/e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  reporter: [['html'], ['list']],
+  use: {
+    baseURL: 'http://localhost:3000',
+    trace: 'on-first-retry',
+    screenshot: 'only-on-failure',
+    video: 'on-first-retry',
+  },
+  projects: [
+    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
+  ],
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+    timeout: 120 * 1000,
+  },
+});
+EOF
+
+mkdir -p tests/e2e
+npm pkg set scripts.test:e2e="playwright test"
+npm pkg set scripts.test:e2e:headed="playwright test --headed"
+npm pkg set scripts.test:e2e:ui="playwright test --ui"
+```
+
+**After bootstrap, verify each tier works:**
+
+```bash
+# Create smoke tests for each tier
+cat > tests/unit/smoke.test.ts << 'EOF'
 import { describe, it, expect } from 'vitest'
 
-describe('Test Setup', () => {
+describe('Unit Test Setup', () => {
   it('works', () => {
     expect(true).toBe(true)
   })
 })
 EOF
 
-# Run it
-npm test
+cat > tests/integration/smoke.test.ts << 'EOF'
+import { describe, it, expect } from 'vitest'
+
+describe('Integration Test Setup', () => {
+  it('works', () => {
+    expect(1 + 1).toBe(2)
+  })
+})
+EOF
+
+cat > tests/e2e/smoke.spec.ts << 'EOF'
+import { test, expect } from '@playwright/test';
+
+test('app loads', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/.+/);
+});
+EOF
+
+# Run each tier
+npm run test:unit
+npm run test:integration
+npm run test:e2e
 ```
 
 **Then continue to WRITE mode.**
@@ -269,7 +418,38 @@ test.describe('User Profile', () => {
 
 Use role-based selectors (`getByRole`, `getByLabel`, `getByText`) over CSS selectors.
 
-### What to Test
+### What to Test by Tier
+
+#### Unit Tests (Vitest) — Test in isolation
+**High value:**
+- Pure functions with branching logic
+- Data transformations and formatting
+- Utility functions
+- Store actions and getters
+- Composables/hooks
+- Validation logic
+
+**Location:** `tests/unit/` or colocated next to source files
+
+#### Integration Tests (Vitest + Testing Library) — Test interactions
+**High value:**
+- Component + store interactions
+- API client + component integration
+- Form submission flows
+- Multi-component interactions
+
+**Location:** `tests/integration/`
+
+#### E2E Tests (Playwright) — Test real user flows
+**High value:**
+- Critical user journeys (signup, login, checkout)
+- Features with complex UI interactions
+- Flows that cross multiple pages
+- Anything that needs a real browser
+
+**Location:** `tests/e2e/`
+
+### What to Test (General)
 
 **High value (always):**
 - Functions with branching logic

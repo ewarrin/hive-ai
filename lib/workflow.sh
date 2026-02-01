@@ -80,9 +80,24 @@ workflow_get() {
     {
       "name": "testing",
       "agent": "tester",
-      "required": false,
+      "required": true,
       "needs_handoff_from": "implementer",
-      "task": "Write and run tests for the implementation.\n\n1. Review what was implemented\n2. Write unit tests\n3. Write integration tests\n4. Run tests and report results\n5. File bugs for failures"
+      "task": "Write and run tests for the implementation.\n\n1. Bootstrap test infrastructure if needed (Vitest + Playwright)\n2. Write unit tests for new functions/utilities\n3. Write integration tests for component interactions\n4. Run all tests and report results\n5. File bugs for failures"
+    },
+    {
+      "name": "e2e_testing",
+      "agent": "e2e-tester",
+      "required": true,
+      "needs_handoff_from": "tester",
+      "task": "Write and run Playwright e2e tests.\n\n1. Set up Playwright with browser if not present\n2. Write e2e tests for critical user flows\n3. Run tests with visible browser (--headed) to verify\n4. Report results with screenshots"
+    },
+    {
+      "name": "browser_validation",
+      "agent": "browser-validator",
+      "required": true,
+      "condition": "has_frontend",
+      "needs_handoff_from": "e2e-tester",
+      "task": "Visually validate the implementation in a real browser.\n\n1. Start dev server if not running\n2. Navigate through the new feature in a real browser\n3. Capture screenshots at key points\n4. Report any visual or functional issues"
     },
     {
       "name": "review",
@@ -128,8 +143,23 @@ EOF
     {
       "name": "testing",
       "agent": "tester",
+      "required": true,
+      "task": "Verify the fix and add regression tests.\n\n1. Write a test that would have caught this bug\n2. Verify the fix passes\n3. Run all existing tests\n4. Report results"
+    },
+    {
+      "name": "e2e_testing",
+      "agent": "e2e-tester",
+      "required": true,
+      "needs_handoff_from": "tester",
+      "task": "Write e2e regression test for the bug fix.\n\n1. Write an e2e test that reproduces the original bug scenario\n2. Verify the test passes with the fix\n3. Run with --headed to visually confirm"
+    },
+    {
+      "name": "browser_validation",
+      "agent": "browser-validator",
       "required": false,
-      "task": "Verify the fix and add regression tests.\n\n1. Write a test that would have caught this bug\n2. Verify the fix passes\n3. Run existing tests\n4. Report results"
+      "condition": "has_frontend",
+      "needs_handoff_from": "e2e-tester",
+      "task": "Visually verify the bug is fixed.\n\n1. Navigate to the affected area\n2. Confirm the bug no longer occurs\n3. Capture before/after screenshots if possible"
     }
   ]
 }
@@ -305,8 +335,8 @@ EOF
 # List all available workflows
 workflow_list() {
     echo "Built-in workflows:"
-    echo "  feature    Full pipeline: architect → implement → UI → test → review → docs"
-    echo "  bugfix     Bug fix: debugger → test"
+    echo "  feature    Full pipeline: architect → implement → UI → test → e2e → browser → review → docs"
+    echo "  bugfix     Bug fix: debugger → test → e2e → browser"
     echo "  refactor   Refactoring: architect → implement → test → review"
     echo "  test       Testing only: tester"
     echo "  review     Code review only: reviewer"
