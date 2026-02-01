@@ -332,6 +332,25 @@ cost_estimate_workflow() {
     echo "$total"
 }
 
+# Check if we should downgrade model to save costs
+# Used by invoke.sh for cost-aware model selection
+should_downgrade_model() {
+    local run_id="$1"
+    local budget="${HIVE_COST_BUDGET:-0}"
+
+    # No budget = no downgrade needed
+    [ "$budget" = "0" ] && return 1
+
+    # Get current spend
+    local spent=$(cost_get_total "$run_id")
+
+    # Check if we've spent more than 60% of budget - start downgrading
+    local threshold=$(awk -v b="$budget" 'BEGIN {printf "%.2f", b * 0.6}')
+    local should=$(awk -v s="$spent" -v t="$threshold" 'BEGIN {print (s >= t) ? 1 : 0}')
+
+    [ "$should" = "1" ]
+}
+
 # ============================================================================
 # History
 # ============================================================================

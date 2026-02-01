@@ -39,6 +39,8 @@ source "$SCRIPT_DIR/git.sh"
 source "$SCRIPT_DIR/agent_memory.sh"
 source "$SCRIPT_DIR/smart_select.sh"
 source "$SCRIPT_DIR/claude_updater.sh"
+source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/invoke.sh"
 
 # ============================================================================
 # Colors
@@ -430,7 +432,7 @@ List ALL files you modified, tasks you created/closed, and any decisions made."
     _PROGRESS_FILES_CHANGED=0
     
     set +e
-    cat "$prompt_file" | claude -p --dangerously-skip-permissions 2>&1 | tee "$output_file"
+    hive_invoke_agent "$agent" "$prompt_file" "$output_file" "$run_id"
     exit_code=$?
     set -e
     
