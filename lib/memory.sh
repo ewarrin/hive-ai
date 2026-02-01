@@ -403,3 +403,69 @@ memory_learn_from_selfeval() {
         esac
     done
 }
+
+# ============================================================================
+# Challenge Pattern Memory
+# ============================================================================
+
+# Record a challenge for pattern learning
+memory_record_challenge() {
+    local from="$1" to="$2" issue="$3" resolution="$4"
+    local category=$(memory_categorize_issue "$issue")
+
+    local entry=$(jq -n \
+        --arg from "$from" --arg to "$to" \
+        --arg cat "$category" --arg res "$resolution" \
+        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{from:$from, to:$to, category:$cat, resolution:$res, timestamp:$ts}')
+
+    memory_update --argjson entry "$entry" \
+        '.challenge_history = ((.challenge_history // []) + [$entry])[-100:]'
+}
+
+# Categorize issue text into known categories
+memory_categorize_issue() {
+    local issue="$1"
+    local lower=$(echo "$issue" | tr '[:upper:]' '[:lower:]')
+
+    case "$lower" in
+        *path*|*file*|*"not found"*|*"doesn't exist"*) echo "wrong_path" ;;
+        *type*|*interface*|*undefined*|*null*) echo "type_error" ;;
+        *import*|*module*|*dependency*) echo "dependency" ;;
+        *design*|*architecture*|*pattern*) echo "architecture" ;;
+        *missing*|*incomplete*|*unfinished*) echo "missing_code" ;;
+        *bug*|*wrong*|*incorrect*) echo "implementation" ;;
+        *) echo "other" ;;
+    esac
+}
+
+# Get challenge stats for reporting
+memory_get_challenge_stats() {
+    memory_read | jq '
+        .challenge_history // [] |
+        {
+            total: length,
+            resolved: [.[] | select(.resolution=="resolved")] | length,
+            by_pair: (group_by(.from + "->" + .to) | map({
+                pair: .[0].from + " -> " + .[0].to,
+                count: length
+            }) | sort_by(-.count)[:5])
+        }'
+}
+
+# Inject challenge context into agent prompt
+# Shows past challenges against this agent so it can be more careful
+memory_challenge_context_for() {
+    local agent="$1"
+    local history=$(memory_read | jq -r --arg a "$agent" '
+        [(.challenge_history // [])[] | select(.to == $a)] |
+        if length < 2 then empty else
+            group_by(.category) | map({cat: .[0].category, n: length}) |
+            sort_by(-.n)[:3][] | "- \(.cat): \(.n) times"
+        end')
+
+    [ -n "$history" ] && echo "
+## Past Challenges Against Your Work
+$history
+Pay extra attention to these areas."
+}

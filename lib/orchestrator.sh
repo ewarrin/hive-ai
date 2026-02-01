@@ -164,7 +164,14 @@ $(cat "$ctx_file")"
 
 $mem_context"
     fi
-    
+
+    # Add challenge history context (past challenges against this agent)
+    local challenge_ctx=$(memory_challenge_context_for "$agent" 2>/dev/null)
+    if [ -n "$challenge_ctx" ]; then
+        context="$context
+$challenge_ctx"
+    fi
+
     # Add codebase index
     local idx_context=$(index_context_for_agent)
     if [ -n "$idx_context" ]; then
@@ -271,7 +278,7 @@ IMPORTANT: At the END of your work, output a self-assessment report in this exac
 }
 HIVE_REPORT-->
 
-Set status to: \"complete\" (all done), \"partial\" (some work done), or \"blocked\" (can't proceed).
+Set status to: \"complete\" (all done), \"partial\" (some work done), \"blocked\" (can't proceed), or \"challenge\" (previous agent's work has a blocking problem).
 Set confidence 0.0-1.0 based on how well the work went.
 List ALL files you modified, tasks you created/closed, and any decisions made."
     
@@ -435,7 +442,35 @@ run_agent_with_validation() {
                         log_agent_complete "$agent" true false "Blocked: $blockers"
                         scratchpad_add_iteration_history "$agent" "blocked" "$blockers"
                         ;;
-                    
+
+                    "challenge")
+                        # Agent is challenging the previous agent's work
+                        local challenged_agent=$(echo "$report" | jq -r '.challenged_agent // ""')
+                        local issue=$(echo "$report" | jq -r '.issue // ""')
+                        local suggestion=$(echo "$report" | jq -r '.suggestion // ""')
+                        local evidence=$(echo "$report" | jq -r '.evidence // ""')
+
+                        print_warn "$agent challenges $challenged_agent: $issue"
+
+                        # Log the challenge
+                        log_challenge "$agent" "$challenged_agent" "$issue" "$suggestion"
+
+                        # Store challenge data for workflow loop to handle rerouting
+                        export HIVE_CHALLENGE_FROM="$agent"
+                        export HIVE_CHALLENGE_TO="$challenged_agent"
+                        export HIVE_CHALLENGE_ISSUE="$issue"
+                        export HIVE_CHALLENGE_SUGGESTION="$suggestion"
+                        export HIVE_CHALLENGE_EVIDENCE="$evidence"
+                        export HIVE_LAST_SELFEVAL_REPORT="$report"
+
+                        memory_record_agent_run "$agent" "$duration" "false" "$attempt"
+                        log_agent_complete "$agent" true false "Challenge: $issue"
+                        scratchpad_reset_iteration
+
+                        # Return special exit code 2 so workflow loop can handle rerouting
+                        return 2
+                        ;;
+
                     *)
                         # Fall through to legacy validation
                         ;;
@@ -497,6 +532,100 @@ Previous output is in: $output_file"
     memory_record_agent_run "$agent" "0" "false" "$max_attempts"
     checkpoint_on_failure "$agent" "Max retries exceeded" $max_attempts
     
+    return 1
+}
+
+# ============================================================================
+# Challenge Rerouting
+# ============================================================================
+
+# Handle a challenge by re-running the challenged agent with challenge context
+# Returns: 0 if challenge resolved, 1 if unresolved (needs human)
+handle_challenge_reroute() {
+    local challenging_agent="$1"
+    local challenged_agent="$2"
+    local issue="$3"
+    local suggestion="$4"
+    local evidence="$5"
+    local epic_id="$6"
+    local run_id="$7"
+    local max_attempts="${HIVE_CHALLENGE_RETRY_ATTEMPTS:-2}"
+
+    print_phase "Challenge: $challenging_agent → $challenged_agent"
+    print_warn "Issue: $issue"
+    [ -n "$suggestion" ] && print_info "Suggestion: $suggestion"
+
+    local output_dir="$HIVE_DIR/runs/$run_id/output"
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        # Build challenge context with attempt info
+        local challenge_task="## Challenge from $challenging_agent (Attempt $attempt/$max_attempts)
+
+The **$challenging_agent** reviewed your work and found a blocking issue:
+
+**Issue:** $issue
+
+**Evidence:** $evidence
+
+**Suggestion:** $suggestion
+
+---
+
+Address this challenge. Review the issue, update your work to resolve it, then output a new HIVE_REPORT.
+
+If you believe the challenge is invalid, explain why in your HIVE_REPORT summary and set status to 'complete' with your rationale."
+
+        # Add retry feedback for attempts > 1
+        if [ $attempt -gt 1 ]; then
+            challenge_task="$challenge_task
+
+---
+RETRY: Your previous response did not resolve the issue. Please:
+1. Re-read the original issue carefully
+2. Verify your fix directly addresses the stated problem
+3. Reference the specific fix in your HIVE_REPORT summary"
+        fi
+
+        local challenge_output="$output_dir/${challenged_agent}_challenge_response_${attempt}.md"
+
+        print_info "Re-running $challenged_agent to address challenge (attempt $attempt/$max_attempts)..."
+        progress_status "Running $challenged_agent (challenge response $attempt/$max_attempts)..." "work"
+
+        if run_agent "$challenged_agent" "$challenge_task" "" "$challenge_output"; then
+            local response_report=$(selfeval_extract "$challenge_output")
+            local response_status=$(echo "$response_report" | jq -r '.status // "unknown"')
+
+            if [ "$response_status" == "complete" ] || [ "$response_status" == "partial" ]; then
+                # Validate response addresses the specific issue
+                if challenge_response_validates "$response_report" "$issue" "$evidence"; then
+                    print_success "$challenged_agent addressed the challenge"
+                    log_challenge_resolved "$challenging_agent" "$challenged_agent" "resolved" "$attempt"
+                    # Record in memory for pattern learning
+                    memory_record_challenge "$challenging_agent" "$challenged_agent" "$issue" "resolved"
+
+                    # Update scratchpad with the response
+                    selfeval_apply_to_scratchpad "$response_report"
+
+                    # Clear challenge state
+                    unset HIVE_CHALLENGE_FROM HIVE_CHALLENGE_TO HIVE_CHALLENGE_ISSUE HIVE_CHALLENGE_SUGGESTION HIVE_CHALLENGE_EVIDENCE
+                    return 0
+                fi
+                print_warn "Response did not address the specific issue (attempt $attempt)"
+            elif [ "$response_status" == "challenge" ]; then
+                # Challenged agent is counter-challenging - escalate to human
+                print_warn "$challenged_agent counter-challenged - escalating to human"
+                log_challenge_resolved "$challenging_agent" "$challenged_agent" "escalated" "$attempt"
+                memory_record_challenge "$challenging_agent" "$challenged_agent" "$issue" "escalated"
+                return 1
+            fi
+        fi
+        ((attempt++))
+    done
+
+    print_warn "$challenged_agent could not address challenge after $max_attempts attempts"
+    log_challenge_resolved "$challenging_agent" "$challenged_agent" "unresolved" "$max_attempts"
+    memory_record_challenge "$challenging_agent" "$challenged_agent" "$issue" "unresolved"
     return 1
 }
 
@@ -1150,8 +1279,74 @@ run_workflow() {
             esac
         fi
         
-        # Run agent
-        if ! run_agent_with_validation "$phase_agent" "$phase_task" "$handoff_id"; then
+        # Run agent and capture exit code
+        local agent_exit_code=0
+        run_agent_with_validation "$phase_agent" "$phase_task" "$handoff_id" || agent_exit_code=$?
+
+        # Handle challenge (exit code 2)
+        if [ "$agent_exit_code" -eq 2 ] && [ -n "${HIVE_CHALLENGE_FROM:-}" ]; then
+            local challenged_agent="${HIVE_CHALLENGE_TO:-}"
+            local challenge_issue="${HIVE_CHALLENGE_ISSUE:-}"
+            local challenge_suggestion="${HIVE_CHALLENGE_SUGGESTION:-}"
+            local challenge_evidence="${HIVE_CHALLENGE_EVIDENCE:-}"
+
+            # Configurable challenge limit per handoff (default: 2)
+            local max_challenges="${HIVE_MAX_CHALLENGES:-2}"
+
+            # Check how many challenges we've done for this handoff
+            local challenge_loop_key="challenge_${phase_agent}_${challenged_agent}"
+            local challenge_count=$(scratchpad_get "$challenge_loop_key" 2>/dev/null || echo "0")
+            challenge_count=$((challenge_count + 0))  # Ensure numeric
+
+            if [ "$challenge_count" -ge "$max_challenges" ]; then
+                # Challenge limit reached - escalate to human
+                print_warn "Challenge limit reached ($max_challenges per handoff)"
+                if ! human_checkpoint "Challenge Unresolved" "$phase_agent challenged $challenged_agent but issue persists after $challenge_count attempt(s). Continue anyway?
+
+Issue: $challenge_issue
+
+Suggestion: $challenge_suggestion"; then
+                    rm -f "$phases_file"
+                    return 1
+                fi
+                # Clear challenge state and continue
+                unset HIVE_CHALLENGE_FROM HIVE_CHALLENGE_TO HIVE_CHALLENGE_ISSUE HIVE_CHALLENGE_SUGGESTION HIVE_CHALLENGE_EVIDENCE
+            else
+                # Under limit - attempt reroute
+                scratchpad_set "$challenge_loop_key" "$((challenge_count + 1))"
+
+                if handle_challenge_reroute "$phase_agent" "$challenged_agent" "$challenge_issue" "$challenge_suggestion" "$challenge_evidence" "$epic_id" "$run_id"; then
+                    # Challenge resolved - re-run the challenging agent
+                    print_info "Re-running $phase_agent after challenge resolution..."
+                    progress_status "Running $phase_agent (post-challenge)..." "work"
+
+                    # Re-run the challenging agent
+                    if ! run_agent_with_validation "$phase_agent" "$phase_task" "$handoff_id"; then
+                        if [ "$phase_required" == "true" ]; then
+                            if ! human_checkpoint "${phase_name} Failed" "$phase_agent failed after challenge resolution. Continue anyway?"; then
+                                rm -f "$phases_file"
+                                return 1
+                            fi
+                        else
+                            print_warn "$phase_name had issues, continuing..."
+                        fi
+                    fi
+                else
+                    # Challenge not resolved - escalate to human
+                    if ! human_checkpoint "Challenge Unresolved" "$phase_agent challenged $challenged_agent. Challenge could not be resolved automatically.
+
+Issue: $challenge_issue
+
+Suggestion: $challenge_suggestion
+
+Continue anyway?"; then
+                        rm -f "$phases_file"
+                        return 1
+                    fi
+                fi
+            fi
+        elif [ "$agent_exit_code" -ne 0 ]; then
+            # Normal failure handling
             if [ -n "$on_failure" ] && [ "$on_failure" != "null" ]; then
                 print_warn "$phase_name failed, routing to $on_failure"
                 local debug_handoff=$(handoff_to_debugger "$phase_agent" "$phase_name failed" "{}")

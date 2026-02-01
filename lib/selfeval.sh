@@ -220,6 +220,11 @@ selfeval_passed() {
             echo "blocked"
             return 1
             ;;
+        "challenge")
+            # Agent is challenging the previous agent's work
+            echo "challenge"
+            return 2
+            ;;
         *)
             echo "unknown_status"
             return 2
@@ -231,8 +236,28 @@ selfeval_passed() {
 selfeval_get_field() {
     local report="$1"
     local field="$2"
-    
+
     echo "$report" | jq -r ".$field // empty"
+}
+
+# Extract challenge data from a HIVE_REPORT with status="challenge"
+# Returns JSON with challenged_agent, issue, evidence, suggestion
+selfeval_get_challenge_data() {
+    local report="$1"
+
+    if [ -z "$report" ]; then
+        echo "{}"
+        return 1
+    fi
+
+    echo "$report" | jq '{
+        challenged_agent: (.challenged_agent // ""),
+        issue: (.issue // ""),
+        evidence: (.evidence // ""),
+        suggestion: (.suggestion // ""),
+        severity: (.severity // "blocking"),
+        can_proceed_with_default: (.can_proceed_with_default // false)
+    }'
 }
 
 selfeval_get_array() {
@@ -392,4 +417,46 @@ selfeval_overall_result() {
 
     echo "$report_result"
     return $?
+}
+
+# ============================================================================
+# Challenge Response Validation
+# ============================================================================
+
+# Validate challenge response addresses the stated issue
+# Returns: 0 if valid, 1 if not
+challenge_response_validates() {
+    local response_report="$1"
+    local original_issue="$2"
+    local original_evidence="$3"
+
+    local summary=$(echo "$response_report" | jq -r '.summary // ""')
+    local handoff=$(echo "$response_report" | jq -r '.handoff_notes // ""')
+    local response_text=$(echo "$summary $handoff" | tr '[:upper:]' '[:lower:]')
+
+    # Extract keywords from issue (words > 3 chars)
+    local issue_keywords=$(echo "$original_issue" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '\n' | awk 'length>3' | sort -u | head -10)
+
+    # Count keyword matches
+    local matches=0
+    for kw in $issue_keywords; do
+        echo "$response_text" | grep -q "$kw" && ((matches++)) || true
+    done
+
+    # Require 2+ keyword matches OR explicit acknowledgment
+    if [ $matches -ge 2 ]; then
+        return 0
+    fi
+
+    if echo "$response_text" | grep -qiE "addressed|fixed|resolved|corrected|challenge"; then
+        return 0
+    fi
+
+    # Check confidence threshold
+    local confidence=$(echo "$response_report" | jq -r '.confidence // 0')
+    if [ "$(echo "$confidence < 0.5" | bc -l 2>/dev/null)" == "1" ]; then
+        return 1
+    fi
+
+    return 1
 }

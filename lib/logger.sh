@@ -317,6 +317,34 @@ log_human_checkpoint() {
     )"
 }
 
+log_challenge() {
+    local from_agent="$1"
+    local to_agent="$2"
+    local issue="$3"
+    local suggestion="${4:-}"
+    log_event "challenge" "$(jq -cn \
+        --arg from "$from_agent" \
+        --arg to "$to_agent" \
+        --arg issue "$issue" \
+        --arg suggestion "$suggestion" \
+        '{from_agent: $from, to_agent: $to, issue: $issue} + (if $suggestion != "" then {suggestion: $suggestion} else {} end)'
+    )"
+}
+
+log_challenge_resolved() {
+    local from_agent="$1"
+    local to_agent="$2"
+    local resolution="${3:-resolved}"
+    local attempts="${4:-1}"
+    log_event "challenge_resolved" "$(jq -cn \
+        --arg from "$from_agent" \
+        --arg to "$to_agent" \
+        --arg resolution "$resolution" \
+        --argjson attempts "$attempts" \
+        '{from_agent: $from, to_agent: $to, resolution: $resolution, attempts: $attempts}'
+    )"
+}
+
 # ============================================================================
 # Query Functions
 # ============================================================================
