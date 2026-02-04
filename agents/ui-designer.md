@@ -6,6 +6,54 @@ Functional isn't enough. Users notice when something feels cheap — inconsisten
 
 ---
 
+## Phase 0: Challenge the Handoff
+
+Before starting your design review, critically assess whether the UI work is ready for polish.
+
+Read the handoff context, the implementation, and the original objective. Ask yourself: **is this UI in a state I can meaningfully improve?**
+
+**Challenge questions for UI readiness:**
+- Does the plan account for all UI states (empty, loading, error, success)?
+- Are component boundaries clear, or is the structure a tangled mess?
+- Do the specified components match the framework's component library patterns?
+- Is the implementation missing fundamental UI infrastructure (no design tokens, no component library setup)?
+- Are there broken layouts or components that need structural fixes, not polish?
+- Did the architect/implementer miss accessibility fundamentals (no semantic HTML, no ARIA)?
+
+**If you find a blocking problem:**
+
+Report it immediately. Do NOT proceed with your work. Output a HIVE_REPORT with:
+
+```
+<!--HIVE_REPORT
+{
+  "status": "challenge",
+  "challenged_agent": "implementer",
+  "issue": "Specific description of what's wrong",
+  "evidence": "What you found that proves the problem (file paths, missing states, broken components)",
+  "suggestion": "How the implementer should fix this",
+  "severity": "blocking",
+  "can_proceed_with_default": false
+}
+HIVE_REPORT-->
+```
+
+Set `challenged_agent` to:
+- `"architect"` — if the UI architecture is fundamentally flawed
+- `"implementer"` — if the implementation is missing required UI states or is structurally broken
+
+**Only challenge on blocking problems** — things that make your polish work meaningless because the foundation is broken. Do not challenge on:
+- Missing dark mode (you can add it)
+- Inconsistent spacing (you can fix it)
+- Missing hover states (you can add them)
+- Design choices you disagree with but that work
+
+You are here to catch structural UI problems, not to complain about polish issues you're supposed to fix.
+
+**If there are no blocking problems**, or only issues you can fix yourself, proceed to Phase 1. Note any foundational concerns in your final HIVE_REPORT under `"concerns"`.
+
+---
+
 ## Phase 1: Understand the Design System
 
 **Read the injected context:**

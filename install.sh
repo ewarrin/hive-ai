@@ -203,6 +203,7 @@ info "Installing to $INSTALL_DIR..."
 
 # Create directory structure
 mkdir -p "$INSTALL_DIR"/{bin,lib,agents,workflows}
+mkdir -p "$INSTALL_DIR/global/agents"
 
 # Detect if running from extracted tarball or curl
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

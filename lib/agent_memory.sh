@@ -425,6 +425,54 @@ agent_memory_show() {
 }
 
 # ============================================================================
+# Warning Context Generation
+# ============================================================================
+
+# Get warning context for an agent based on past patterns
+# Used to inject warnings into agent prompts based on learned patterns
+agent_memory_get_warnings() {
+    local agent="$1"
+
+    # Check project memory for agent patterns
+    local patterns=$(memory_read 2>/dev/null | jq -r --arg a "$agent" '.agent_patterns[$a] // empty' 2>/dev/null)
+
+    [ -z "$patterns" ] && return
+
+    local challenge_rate=$(echo "$patterns" | jq -r '.challenge_rate // 0')
+    local avg_confidence=$(echo "$patterns" | jq -r '.avg_confidence // 0')
+
+    # Also check agent-specific memory for common issues
+    local memory_file=$(_agent_memory_file "$agent")
+    local common_issues=""
+    if [ -f "$memory_file" ]; then
+        common_issues=$(jq -r '.patterns.common_issues[:3][] | "- \(.type): \(.description)"' "$memory_file" 2>/dev/null)
+    fi
+
+    local warnings=""
+
+    # Warn if high challenge rate
+    if [ "$(echo "$challenge_rate > 0.3" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+        warnings="$warnings
+- Your work has been challenged frequently. Double-check your output."
+    fi
+
+    # Warn if low confidence historically
+    if [ "$(echo "$avg_confidence < 0.7 && $avg_confidence > 0" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+        warnings="$warnings
+- Historical confidence is low. Be thorough and explicit."
+    fi
+
+    # Add common issues
+    if [ -n "$common_issues" ]; then
+        warnings="$warnings
+Based on previous runs, watch out for:
+$common_issues"
+    fi
+
+    [ -n "$warnings" ] && echo "$warnings"
+}
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
